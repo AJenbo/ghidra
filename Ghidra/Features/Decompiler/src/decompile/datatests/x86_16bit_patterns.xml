@@ -21,6 +21,9 @@ d2b105d1e0d1d2fe
 c97402ebf68b5e06
 89078957025dc3
 </bytechunk>
+<bytechunk space="ram" offset="0x1100" readonly="true">
+5589e58b46048b560603460813560a5dc39090909090909090909090909090905589e58b46048b56062b46081b560a5dc3
+</bytechunk>
 <!-- Test 1: signdiv4 at 0x1000 - signed division by 4 using cwd/xor/sub/sar/xor/sub -->
 <symbol space="ram" offset="0x1000" name="signdiv4"/>
 <!-- Test 2: signdiv8 at 0x1020 - signed division by 8 -->
@@ -33,6 +36,10 @@ c97402ebf68b5e06
 <symbol space="ram" offset="0x1080" name="addah"/>
 <!-- Test 6: shlrcl5 at 0x10a0 - 32-bit shift via shl/rcl loop -->
 <symbol space="ram" offset="0x10a0" name="shlrcl5"/>
+<!-- Test 7: add_long_ret at 0x1100 - 32-bit add via add/adc returning in DX:AX -->
+<symbol space="ram" offset="0x1100" name="add_long_ret"/>
+<!-- Test 8: sub_long_ret at 0x1120 - 32-bit sub via sub/sbb returning in DX:AX -->
+<symbol space="ram" offset="0x1120" name="sub_long_ret"/>
 </binaryimage>
 <script>
   <!-- Test 1: Signed division by 4 -->
@@ -65,6 +72,16 @@ c97402ebf68b5e06
   <com>lo fu shlrcl5</com>
   <com>decompile</com>
   <com>print C</com>
+  <!-- Test 7: 32-bit add via add/adc -->
+  <com>parse line extern int4 add_long_ret(int2 lo1, int2 hi1, int2 lo2, int2 hi2);</com>
+  <com>lo fu add_long_ret</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <!-- Test 8: 32-bit sub via sub/sbb -->
+  <com>parse line extern int4 sub_long_ret(int2 lo1, int2 hi1, int2 lo2, int2 hi2);</com>
+  <com>lo fu sub_long_ret</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <!-- Test 1: Signed division by 4 should produce / 4, not the xor/sub mess -->
@@ -80,4 +97,8 @@ c97402ebf68b5e06
 <!-- Test 6: shl/rcl loop - currently expected to NOT produce clean << 5 (this is a known limitation) -->
 <!-- We test that it at least decompiles without error by checking for the function signature -->
 <stringmatch name="ShlRcl5Exists" min="1" max="1">void shlrcl5</stringmatch>
+<!-- Test 7: 32-bit add should produce CONCAT + CONCAT, not CARRY2 -->
+<stringmatch name="AddLong" min="1" max="1">CONCAT22.*\+.*CONCAT22</stringmatch>
+<!-- Test 8: 32-bit sub should produce CONCAT - CONCAT, not borrow mess -->
+<stringmatch name="SubLong" min="1" max="1">CONCAT22.*-.*CONCAT22</stringmatch>
 </decompilertest>

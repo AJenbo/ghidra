@@ -11247,4 +11247,409 @@ int4 RuleExpandLoad::applyOp(PcodeOp *op,Funcdata &data)
   return 1;
 }
 
+/// \class RulePieceCarryAdd
+/// \brief Collapse carry-based add/sub feeding a PIECE:  `PIECE(hi1+hi2+zext(carry(lo1,lo2)), lo1+lo2)` => `PIECE(hi1,lo1) + PIECE(hi2,lo2)`
+///
+/// Also handles subtraction: `PIECE(hi1-hi2-zext(lo1<lo2), lo1-lo2)` => `PIECE(hi1,lo1) - PIECE(hi2,lo2)`
+void RulePieceCarryAdd::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_PIECE);
+}
+
+/// \brief Check if \b vn is ZEXT of CARRY(a,b) and that a,b match lo1,lo2 (in either order)
+/// \param vn is the varnode to check
+/// \param lo1 is the first expected operand
+/// \param lo2 is the second expected operand
+/// \return \b true if the pattern matches
+static bool isZextCarry(Varnode *vn,Varnode *lo1,Varnode *lo2)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *zop = vn->getDef();
+  if (zop->code() != CPUI_INT_ZEXT) return false;
+  Varnode *cvn = zop->getIn(0);
+  if (!cvn->isWritten()) return false;
+  PcodeOp *cop = cvn->getDef();
+  if (cop->code() != CPUI_INT_CARRY) return false;
+  Varnode *a = cop->getIn(0);
+  Varnode *b = cop->getIn(1);
+  if ((a == lo1 && b == lo2) || (a == lo2 && b == lo1))
+    return true;
+  return false;
+}
+
+/// \brief Check if \b vn is ZEXT of INT_LESS(lo1,lo2) (unsigned borrow)
+/// \param vn is the varnode to check
+/// \param lo1 is the expected first operand (minuend)
+/// \param lo2 is the expected second operand (subtrahend)
+/// \return \b true if the pattern matches
+static bool isZextLess(Varnode *vn,Varnode *lo1,Varnode *lo2)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *zop = vn->getDef();
+  if (zop->code() != CPUI_INT_ZEXT) return false;
+  Varnode *cvn = zop->getIn(0);
+  if (!cvn->isWritten()) return false;
+  PcodeOp *cop = cvn->getDef();
+  if (cop->code() != CPUI_INT_LESS) return false;
+  // For borrow, order matters: lo1 < lo2
+  if (cop->getIn(0) == lo1 && cop->getIn(1) == lo2)
+    return true;
+  return false;
+}
+
+/// \brief Check if \b vn equals \b -1 * \b base (i.e. negated via INT_MULT by -1)
+/// \param vn is the varnode to check
+/// \param base is the expected base varnode being negated
+/// \param size is the size in bytes for the mask
+/// \return \b true if vn = base * -1
+static bool isNegation(Varnode *vn,Varnode *base,int4 size)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *mop = vn->getDef();
+  if (mop->code() != CPUI_INT_MULT) return false;
+  Varnode *a = mop->getIn(0);
+  Varnode *b = mop->getIn(1);
+  if (a == base && b->isConstant() && b->getOffset() == calc_mask(size))
+    return true;
+  if (b == base && a->isConstant() && a->getOffset() == calc_mask(size))
+    return true;
+  if (base == (Varnode *)0) {
+    if (b->isConstant() && b->getOffset() == calc_mask(size))
+      return true;
+    if (a->isConstant() && a->getOffset() == calc_mask(size))
+      return true;
+  }
+  return false;
+}
+
+/// \brief Extract lo1 and lo2 from the lo part of a sub pattern
+/// \param loOp is the defining op of the lo result
+/// \param lo1 will hold the minuend
+/// \param lo2 will hold the subtrahend
+/// \return \b true if lo is lo1-lo2 in some form
+static bool matchLoSub(PcodeOp *loOp,Varnode *&lo1,Varnode *&lo2)
+
+{
+  if (loOp->code() == CPUI_INT_SUB) {
+    lo1 = loOp->getIn(0);
+    lo2 = loOp->getIn(1);
+    return true;
+  }
+  if (loOp->code() == CPUI_INT_ADD) {
+    // a + b*(-1) form
+    Varnode *a = loOp->getIn(0);
+    Varnode *b = loOp->getIn(1);
+    int4 size = a->getSize();
+    if (b->isWritten() && b->getDef()->code() == CPUI_INT_MULT) {
+      PcodeOp *mop = b->getDef();
+      Varnode *m0 = mop->getIn(0);
+      Varnode *m1 = mop->getIn(1);
+      if (m1->isConstant() && m1->getOffset() == calc_mask(size)) {
+	lo1 = a;
+	lo2 = m0;
+	return true;
+      }
+      if (m0->isConstant() && m0->getOffset() == calc_mask(size)) {
+	lo1 = a;
+	lo2 = m1;
+	return true;
+      }
+    }
+    if (a->isWritten() && a->getDef()->code() == CPUI_INT_MULT) {
+      PcodeOp *mop = a->getDef();
+      Varnode *m0 = mop->getIn(0);
+      Varnode *m1 = mop->getIn(1);
+      if (m1->isConstant() && m1->getOffset() == calc_mask(size)) {
+	lo1 = b;
+	lo2 = m0;
+	return true;
+      }
+      if (m0->isConstant() && m0->getOffset() == calc_mask(size)) {
+	lo1 = b;
+	lo2 = m1;
+	return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// \brief Try to match the hi part as hi1 + hi2 + zext(carry(lo1,lo2)) for the add pattern
+/// \param hiVn is the hi result varnode
+/// \param lo1 is the lo operand 1
+/// \param lo2 is the lo operand 2
+/// \param hi1 will hold the first hi operand on success
+/// \param hi2 will hold the second hi operand on success
+/// \return \b true if matched
+static bool matchHiAdd(Varnode *hiVn,Varnode *lo1,Varnode *lo2,Varnode *&hi1,Varnode *&hi2)
+
+{
+  if (!hiVn->isWritten()) return false;
+  PcodeOp *hiOp = hiVn->getDef();
+  if (hiOp->code() != CPUI_INT_ADD) return false;
+  Varnode *a = hiOp->getIn(0);
+  Varnode *b = hiOp->getIn(1);
+
+  // Case 1: ADD(something, zext(carry(lo1,lo2)))  =>  something is hi1+hi2 or just hi1
+  // Case 2: ADD(zext(carry(lo1,lo2)), something)
+  for (int4 j = 0; j < 2; ++j) {
+    Varnode *candidate = (j == 0) ? b : a;
+    Varnode *other = (j == 0) ? a : b;
+
+    if (isZextCarry(candidate, lo1, lo2)) {
+      // other is hi1 + hi2 or just hi1 (with hi2 = 0)
+      if (other->isWritten() && other->getDef()->code() == CPUI_INT_ADD) {
+	hi1 = other->getDef()->getIn(0);
+	hi2 = other->getDef()->getIn(1);
+      }
+      else {
+	hi1 = other;
+	hi2 = (Varnode *)0;	// hi2 is implicitly 0
+      }
+      return true;
+    }
+
+    // Case 3: other is ADD and one of its inputs is zext(carry)
+    if (other->isWritten() && other->getDef()->code() == CPUI_INT_ADD) {
+      PcodeOp *innerAdd = other->getDef();
+      Varnode *ia = innerAdd->getIn(0);
+      Varnode *ib = innerAdd->getIn(1);
+      if (isZextCarry(ia, lo1, lo2)) {
+	hi1 = candidate;
+	hi2 = ib;
+	return true;
+      }
+      if (isZextCarry(ib, lo1, lo2)) {
+	hi1 = candidate;
+	hi2 = ia;
+	return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// \brief Try to match the hi part as hi1 - hi2 - zext(lo1 < lo2) for the sub pattern
+/// \param hiVn is the hi result varnode
+/// \param lo1 is the lo operand 1 (minuend)
+/// \param lo2 is the lo operand 2 (subtrahend)
+/// \param hi1 will hold the first hi operand on success
+/// \param hi2 will hold the second hi operand on success
+/// \return \b true if matched
+static bool matchHiSub(Varnode *hiVn,Varnode *lo1,Varnode *lo2,Varnode *&hi1,Varnode *&hi2)
+
+{
+  if (!hiVn->isWritten()) return false;
+  PcodeOp *hiOp = hiVn->getDef();
+  int4 hiSize = hiVn->getSize();
+
+  // Direct form: SUB(SUB(hi1, hi2), zext(less(lo1,lo2)))
+  if (hiOp->code() == CPUI_INT_SUB) {
+    Varnode *subA = hiOp->getIn(0);
+    Varnode *subB = hiOp->getIn(1);
+    if (isZextLess(subB, lo1, lo2)) {
+      if (subA->isWritten() && subA->getDef()->code() == CPUI_INT_SUB) {
+	hi1 = subA->getDef()->getIn(0);
+	hi2 = subA->getDef()->getIn(1);
+	return true;
+      }
+      // hi2 is implicitly 0
+      hi1 = subA;
+      hi2 = (Varnode *)0;
+      return true;
+    }
+  }
+
+  // Normalized form via ADD and MULT by -1:
+  // ADD(ADD(hi1, hi2*(-1)), zext(less)*(-1))
+  // or ADD(hi1, ADD(hi2*(-1), zext(less)*(-1)))
+  // etc.
+  if (hiOp->code() != CPUI_INT_ADD) return false;
+  Varnode *a = hiOp->getIn(0);
+  Varnode *b = hiOp->getIn(1);
+
+  // Look for negated zext(less) in the sum tree
+  for (int4 j = 0; j < 2; ++j) {
+    Varnode *candidate = (j == 0) ? b : a;
+    Varnode *other = (j == 0) ? a : b;
+
+    // candidate might be -zext(less(lo1,lo2))
+    if (candidate->isWritten()) {
+      Varnode *zextVn = (Varnode *)0;
+      if (isNegation(candidate, (Varnode *)0, hiSize)) {
+	// Extract what's being negated
+	PcodeOp *mop = candidate->getDef();
+	Varnode *m0 = mop->getIn(0);
+	Varnode *m1 = mop->getIn(1);
+	zextVn = m0->isConstant() ? m1 : m0;
+      }
+      if (zextVn != (Varnode *)0 && isZextLess(zextVn, lo1, lo2)) {
+	// other should be hi1 - hi2, i.e. hi1 + hi2*(-1) or ADD(hi1, neg(hi2))
+	if (other->isWritten() && other->getDef()->code() == CPUI_INT_ADD) {
+	  PcodeOp *innerAdd = other->getDef();
+	  Varnode *ia = innerAdd->getIn(0);
+	  Varnode *ib = innerAdd->getIn(1);
+	  // One of ia,ib should be negated
+	  if (ib->isWritten() && isNegation(ib, (Varnode *)0, hiSize)) {
+	    PcodeOp *nm = ib->getDef();
+	    Varnode *nm0 = nm->getIn(0);
+	    Varnode *nm1 = nm->getIn(1);
+	    hi1 = ia;
+	    hi2 = nm0->isConstant() ? nm1 : nm0;
+	    return true;
+	  }
+	  if (ia->isWritten() && isNegation(ia, (Varnode *)0, hiSize)) {
+	    PcodeOp *nm = ia->getDef();
+	    Varnode *nm0 = nm->getIn(0);
+	    Varnode *nm1 = nm->getIn(1);
+	    hi1 = ib;
+	    hi2 = nm0->isConstant() ? nm1 : nm0;
+	    return true;
+	  }
+	}
+	if (other->isWritten() && other->getDef()->code() == CPUI_INT_SUB) {
+	  hi1 = other->getDef()->getIn(0);
+	  hi2 = other->getDef()->getIn(1);
+	  return true;
+	}
+	// other is just hi1 with hi2 = 0
+	hi1 = other;
+	hi2 = (Varnode *)0;
+	return true;
+      }
+    }
+
+    // candidate might be ADD(something, -zext(less))
+    if (other->isWritten() && other->getDef()->code() == CPUI_INT_ADD) {
+      PcodeOp *innerAdd = other->getDef();
+      for (int4 k = 0; k < 2; ++k) {
+	Varnode *ic = innerAdd->getIn(k);
+	Varnode *io = innerAdd->getIn(1 - k);
+	Varnode *izext = (Varnode *)0;
+	if (ic->isWritten()) {
+	  PcodeOp *icDef = ic->getDef();
+	  if (icDef->code() == CPUI_INT_MULT) {
+	    Varnode *m0 = icDef->getIn(0);
+	    Varnode *m1 = icDef->getIn(1);
+	    if (m1->isConstant() && m1->getOffset() == calc_mask(hiSize))
+	      izext = m0;
+	    else if (m0->isConstant() && m0->getOffset() == calc_mask(hiSize))
+	      izext = m1;
+	  }
+	}
+	if (izext != (Varnode *)0 && isZextLess(izext, lo1, lo2)) {
+	  // candidate is hi1 or negated hi2, io is the other
+	  if (io->isWritten() && isNegation(io, (Varnode *)0, hiSize)) {
+	    PcodeOp *nm = io->getDef();
+	    Varnode *nm0 = nm->getIn(0);
+	    Varnode *nm1 = nm->getIn(1);
+	    hi1 = candidate;
+	    hi2 = nm0->isConstant() ? nm1 : nm0;
+	    return true;
+	  }
+	  if (candidate->isWritten() && isNegation(candidate, (Varnode *)0, hiSize)) {
+	    PcodeOp *nm = candidate->getDef();
+	    Varnode *nm0 = nm->getIn(0);
+	    Varnode *nm1 = nm->getIn(1);
+	    hi1 = io;
+	    hi2 = nm0->isConstant() ? nm1 : nm0;
+	    return true;
+	  }
+	  // Simple: candidate = hi1, hi2 = 0 (shouldn't normally happen for sub)
+	  hi1 = candidate;
+	  hi2 = (Varnode *)0;
+	  return true;
+	}
+      }
+    }
+  }
+  return false;
+}
+
+int4 RulePieceCarryAdd::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  // PIECE(hi_result, lo_result)
+  Varnode *hiVn = op->getIn(0);
+  Varnode *loVn = op->getIn(1);
+
+  if (!loVn->isWritten()) return 0;
+  PcodeOp *loOp = loVn->getDef();
+
+  Varnode *lo1, *lo2;
+  Varnode *hi1, *hi2;
+  bool isSub = false;
+
+  // Try addition pattern: lo = lo1 + lo2
+  if (loOp->code() == CPUI_INT_ADD) {
+    lo1 = loOp->getIn(0);
+    lo2 = loOp->getIn(1);
+    if (matchHiAdd(hiVn, lo1, lo2, hi1, hi2)) {
+      isSub = false;
+    }
+    else {
+      // Try subtraction pattern: lo = lo1 + lo2*(-1)  i.e. lo1 - lo2
+      Varnode *slo1, *slo2;
+      if (matchLoSub(loOp, slo1, slo2)) {
+	if (matchHiSub(hiVn, slo1, slo2, hi1, hi2)) {
+	  lo1 = slo1;
+	  lo2 = slo2;
+	  isSub = true;
+	}
+	else
+	  return 0;
+      }
+      else
+	return 0;
+    }
+  }
+  else if (loOp->code() == CPUI_INT_SUB) {
+    lo1 = loOp->getIn(0);
+    lo2 = loOp->getIn(1);
+    if (matchHiSub(hiVn, lo1, lo2, hi1, hi2)) {
+      isSub = true;
+    }
+    else
+      return 0;
+  }
+  else
+    return 0;
+
+  int4 loSize = loVn->getSize();
+  int4 hiSize = hiVn->getSize();
+  int4 wholeSize = loSize + hiSize;
+
+  // Sanity check: output size must match
+  if ((int4)op->getOut()->getSize() != wholeSize) return 0;
+
+  // Build PIECE(hi1, lo1)
+  PcodeOp *piece1op = data.newOp(2, op->getAddr());
+  data.opSetOpcode(piece1op, CPUI_PIECE);
+  Varnode *piece1 = data.newUniqueOut(wholeSize, piece1op);
+  data.opSetInput(piece1op, hi1, 0);
+  data.opSetInput(piece1op, lo1, 1);
+  data.opInsertBefore(piece1op, op);
+
+  // Build PIECE(hi2, lo2) -- if hi2 is null, use constant 0
+  PcodeOp *piece2op = data.newOp(2, op->getAddr());
+  data.opSetOpcode(piece2op, CPUI_PIECE);
+  Varnode *piece2 = data.newUniqueOut(wholeSize, piece2op);
+  if (hi2 == (Varnode *)0)
+    hi2 = data.newConstant(hiSize, 0);
+  data.opSetInput(piece2op, hi2, 0);
+  data.opSetInput(piece2op, lo2, 1);
+  data.opInsertBefore(piece2op, op);
+
+  // Transform original PIECE into ADD or SUB
+  data.opSetOpcode(op, isSub ? CPUI_INT_SUB : CPUI_INT_ADD);
+  data.opSetInput(op, piece1, 0);
+  data.opSetInput(op, piece2, 1);
+
+  return 1;
+}
+
 } // End namespace ghidra
