@@ -30,6 +30,9 @@ c97402ebf68b5e06
 <bytechunk space="ram" offset="0x1300" readonly="true">
 5589e58b46048b5606d1e0d1d25dc3
 </bytechunk>
+<bytechunk space="ram" offset="0x1400" readonly="true">
+5589e58b46048b5606d1ead1d85dc3
+</bytechunk>
 <!-- Test 1: signdiv4 at 0x1000 - signed division by 4 using cwd/xor/sub/sar/xor/sub -->
 <symbol space="ram" offset="0x1000" name="signdiv4"/>
 <!-- Test 2: signdiv8 at 0x1020 - signed division by 8 -->
@@ -50,6 +53,8 @@ c97402ebf68b5e06
 <symbol space="ram" offset="0x1200" name="neg_long_ret"/>
 <!-- Test 10: shl32_1_ret at 0x1300 - 32-bit left shift by 1 via shl/rcl -->
 <symbol space="ram" offset="0x1300" name="shl32_1_ret"/>
+<!-- Test 11: shr32_1_ret at 0x1400 - 32-bit unsigned right shift by 1 via shr/rcr -->
+<symbol space="ram" offset="0x1400" name="shr32_1_ret"/>
 </binaryimage>
 <script>
   <!-- Test 1: Signed division by 4 -->
@@ -102,6 +107,11 @@ c97402ebf68b5e06
   <com>lo fu shl32_1_ret</com>
   <com>decompile</com>
   <com>print C</com>
+  <!-- Test 11: 32-bit right shift by 1 via shr/rcr -->
+  <com>parse line extern uint4 shr32_1_ret(uint2 lo, uint2 hi);</com>
+  <com>lo fu shr32_1_ret</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <!-- Test 1: Signed division by 4 should produce / 4, not the xor/sub mess -->
@@ -125,4 +135,6 @@ c97402ebf68b5e06
 <stringmatch name="NegLong" min="1" max="1">-CONCAT22</stringmatch>
 <!-- Test 10: 32-bit shift left should produce << 1 -->
 <stringmatch name="ShiftLeft32" min="1" max="1">CONCAT22.*&lt;&lt; 1</stringmatch>
+<!-- Test 11: 32-bit right shift should produce >> 1 -->
+<stringmatch name="ShiftRight32" min="1" max="1">CONCAT22.*>> 1</stringmatch>
 </decompilertest>

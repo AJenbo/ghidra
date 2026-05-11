@@ -11909,4 +11909,158 @@ int4 RulePieceShiftLeft::applyOp(PcodeOp *op,Funcdata &data)
   return 0;
 }
 
+/// \class RulePieceShiftRight
+/// \brief Collapse a carry-propagation right shift feeding a PIECE:
+/// `PIECE(hi >> N, (lo >> N) | (hi << (K-N)))` => `PIECE(hi, lo) >> N`
+///
+/// Handles both unsigned (INT_RIGHT) and signed/arithmetic (INT_SRIGHT) right shifts.
+/// For N=1, the carry inject may appear as `ZEXT((hi & 1) != 0) << (K-1)`.
+void RulePieceShiftRight::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_PIECE);
+}
+
+/// Helper: check if \b vn injects bits from \b hi into the high part of lo.
+/// Matches patterns like: `INT_LEFT(X, K-N)` where X derives from the bottom N bits of hi.
+/// For N=1: `INT_LEFT(INT_ZEXT(INT_NOTEQUAL(INT_AND(hi, 1), 0)), K-1)`
+/// General: `INT_LEFT(INT_AND(hi, mask), K-N)` or `INT_LEFT(hi, K-N)` (when N bits at bottom)
+static bool isCarryInject(Varnode *vn, int4 pieceSize, Varnode *&hiBase, int4 &shiftAmt)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *def = vn->getDef();
+  if (def->code() != CPUI_INT_LEFT) return false;
+
+  Varnode *saVn = def->getIn(1);
+  if (!saVn->isConstant()) return false;
+  int4 K = pieceSize * 8;
+  int4 leftSa = (int4)saVn->getOffset();
+  if (leftSa <= 0 || leftSa >= K) return false;
+  int4 N = K - leftSa;  // right shift amount
+
+  Varnode *src = def->getIn(0);
+  
+  // Form 1: INT_LEFT(INT_ZEXT(INT_NOTEQUAL(INT_AND(hi, 1), 0)), K-1)  for N=1
+  if (src->isWritten()) {
+    PcodeOp *srcDef = src->getDef();
+    if (srcDef->code() == CPUI_INT_ZEXT) {
+      Varnode *boolVn = srcDef->getIn(0);
+      if (boolVn->isWritten()) {
+        PcodeOp *boolOp = boolVn->getDef();
+        if (boolOp->code() == CPUI_INT_NOTEQUAL) {
+          Varnode *cmpA = boolOp->getIn(0);
+          Varnode *cmpB = boolOp->getIn(1);
+          if (cmpB->isConstant() && cmpB->getOffset() == 0 && cmpA->isWritten()) {
+            PcodeOp *andOp = cmpA->getDef();
+            if (andOp->code() == CPUI_INT_AND) {
+              Varnode *andA = andOp->getIn(0);
+              Varnode *andB = andOp->getIn(1);
+              uintb mask = ((uintb)1 << N) - 1;
+              if (andB->isConstant() && andB->getOffset() == mask) {
+                hiBase = andA;
+                shiftAmt = N;
+                return true;
+              }
+              if (andA->isConstant() && andA->getOffset() == mask) {
+                hiBase = andB;
+                shiftAmt = N;
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+    // Form 2: INT_LEFT(INT_AND(hi, mask), K-N) - direct mask and shift
+    if (srcDef->code() == CPUI_INT_AND) {
+      Varnode *andA = srcDef->getIn(0);
+      Varnode *andB = srcDef->getIn(1);
+      uintb mask = ((uintb)1 << N) - 1;
+      if (andB->isConstant() && andB->getOffset() == mask) {
+        hiBase = andA;
+        shiftAmt = N;
+        return true;
+      }
+      if (andA->isConstant() && andA->getOffset() == mask) {
+        hiBase = andB;
+        shiftAmt = N;
+        return true;
+      }
+    }
+  }
+
+  // Form 3: INT_LEFT(hi, K-N) - when N=1 or when full value works (shift pushes out high bits)
+  // This works because (hi << (K-N)) naturally masks to the bottom N bits shifted up
+  hiBase = src;
+  shiftAmt = N;
+  return true;
+}
+
+int4 RulePieceShiftRight::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  Varnode *hiVn = op->getIn(0);
+  Varnode *loVn = op->getIn(1);
+
+  // hi_result must be a right shift by constant
+  if (!hiVn->isWritten()) return 0;
+  PcodeOp *hiOp = hiVn->getDef();
+  OpCode hiOpc = hiOp->code();
+  if (hiOpc != CPUI_INT_RIGHT && hiOpc != CPUI_INT_SRIGHT) return 0;
+  Varnode *hi = hiOp->getIn(0);
+  Varnode *hiSaVn = hiOp->getIn(1);
+  if (!hiSaVn->isConstant()) return 0;
+  int4 N = (int4)hiSaVn->getOffset();
+  if (N <= 0) return 0;
+  int4 pieceSize = hi->getSize();
+  if (N >= pieceSize * 8) return 0;
+
+  // lo_result must be: (lo >> N) | carryInject(hi, N)
+  if (!loVn->isWritten()) return 0;
+  PcodeOp *loOp = loVn->getDef();
+  if (loOp->code() != CPUI_INT_OR) return 0;
+
+  for (int4 i = 0; i < 2; ++i) {
+    Varnode *orA = loOp->getIn(i);
+    Varnode *orB = loOp->getIn(1 - i);
+
+    // orA should be lo >> N
+    if (!orA->isWritten()) continue;
+    PcodeOp *loShOp = orA->getDef();
+    if (loShOp->code() != CPUI_INT_RIGHT) continue;
+    Varnode *loSaVn2 = loShOp->getIn(1);
+    if (!loSaVn2->isConstant()) continue;
+    if ((int4)loSaVn2->getOffset() != N) continue;
+    Varnode *lo = loShOp->getIn(0);
+
+    // orB should be carry inject from hi
+    Varnode *carryHi = (Varnode *)0;
+    int4 carryN = 0;
+    if (!isCarryInject(orB, pieceSize, carryHi, carryN)) continue;
+    if (carryN != N) continue;
+    if (carryHi != hi) continue;
+
+    // Pattern matched! Transform:
+    //   PIECE(hi_result, lo_result) => PIECE(hi, lo) >> N
+    int4 wholesize = hi->getSize() + lo->getSize();
+
+    PcodeOp *pieceOp = data.newOp(2, op->getAddr());
+    data.opSetOpcode(pieceOp, CPUI_PIECE);
+    Varnode *pieceOut = data.newUniqueOut(wholesize, pieceOp);
+    data.opSetInput(pieceOp, hi, 0);
+    data.opSetInput(pieceOp, lo, 1);
+    data.opInsertBefore(pieceOp, op);
+
+    // Use the same shift type (signed or unsigned) as the hi shift
+    data.opSetOpcode(op, hiOpc);
+    data.opSetInput(op, pieceOut, 0);
+    data.opSetInput(op, data.newConstant(4, (uintb)N), 1);
+
+    return 1;
+  }
+
+  return 0;
+}
+
 } // End namespace ghidra
