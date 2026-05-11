@@ -20,8 +20,11 @@
 import java.util.*;
 
 import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.SourceType;
 
 /**
@@ -86,6 +89,176 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 		FUNC_SIGS.put("aFNalsar", SigType.LONG_LONG_INT);
 	}
 
+	/**
+	 * Byte-pattern signatures for MSC 5.x/6.x runtime functions.
+	 * Each entry maps a byte-pattern prefix at a function entry to a function name.
+	 *
+	 * NOTE: These patterns must be validated against actual binaries.
+	 * The byte sequences are derived from MSC 5.x SLIBCE.LIB / SLIBC7.LIB.
+	 * Patterns use mask bytes: 0xFF = must match, 0x00 = wildcard.
+	 *
+	 * To add patterns for a specific binary, disassemble the runtime functions
+	 * and capture their first N bytes as patterns here.
+	 */
+	private static class BytePattern {
+		String name;      // base name without underscores (e.g. "aNlmul")
+		byte[] bytes;     // byte pattern to match
+		byte[] mask;      // mask (0xff = must match, 0x00 = wildcard)
+
+		BytePattern(String name, byte[] bytes, byte[] mask) {
+			this.name = name;
+			this.bytes = bytes;
+			this.mask = mask;
+		}
+
+		BytePattern(String name, byte[] bytes) {
+			this.name = name;
+			this.bytes = bytes;
+			this.mask = new byte[bytes.length];
+			Arrays.fill(this.mask, (byte) 0xff);
+		}
+	}
+
+	/**
+	 * Known byte patterns for MSC 5.x runtime functions.
+	 * These are empty by default — add patterns from your specific binary.
+	 * Use the Ghidra listing or hex dump to capture entry bytes.
+	 *
+	 * Example for a specific binary's __aNlmul:
+	 *   new BytePattern("aNlmul", new byte[]{0x55, (byte)0x8b, (byte)0xec, ...})
+	 */
+	private static final BytePattern[] BYTE_PATTERNS = {
+		// Add patterns here as they are identified from specific binaries.
+		// See script description for format.
+	};
+
+	/**
+	 * Heuristic: identify likely long-arithmetic runtime functions by their
+	 * structural properties. Analyzes parameter count, function body size,
+	 * and call relationships to identify __aNlmul, __aNldiv, __aNlrem.
+	 *
+	 * This works on unnamed functions in freshly imported binaries.
+	 */
+	private Map<Function, String> identifyByStructure(FunctionManager funcManager) {
+		Map<Function, String> identified = new LinkedHashMap<>();
+		Function mulCandidate = null;
+		Function divCandidate = null;
+		Function remCandidate = null;
+		List<Function> fourParamFuncs = new ArrayList<>();
+
+		// Collect all unnamed functions with 4 word-sized parameters
+		FunctionIterator iter = funcManager.getFunctions(true);
+		while (iter.hasNext() && !monitor.isCancelled()) {
+			Function func = iter.next();
+			if (!func.getName().startsWith("FUN_")) continue;
+
+			Parameter[] params = func.getParameters();
+			if (params.length != 4) continue;
+
+			// All params must be 2 bytes (word)
+			boolean allWord = true;
+			for (Parameter p : params) {
+				if (p.getLength() != 2) { allWord = false; break; }
+			}
+			if (!allWord) continue;
+
+			// Count references to this function (how many call sites)
+			int callCount = 0;
+			var refs = currentProgram.getReferenceManager()
+				.getReferencesTo(func.getEntryPoint());
+			while (refs.hasNext()) {
+				refs.next();
+				callCount++;
+			}
+
+			// Runtime helpers are called from multiple sites
+			if (callCount < 2) continue;
+
+			fourParamFuncs.add(func);
+		}
+
+		// Now classify: smallest body = mul, largest = div or rem
+		// __aNlmul is typically 30-50 bytes, __aNldiv/rem are 100-200 bytes
+		for (Function func : fourParamFuncs) {
+			long bodySize = func.getBody().getNumAddresses();
+
+			if (bodySize < 80) {
+				// Small function with 4 word params called multiple times = likely __aNlmul
+				if (mulCandidate == null || bodySize < mulCandidate.getBody().getNumAddresses()) {
+					mulCandidate = func;
+				}
+			}
+		}
+
+		// For div/rem: they're the larger functions. __aNlrem typically calls __aNldiv
+		// or is structured similarly. We distinguish by: __aNldiv has NO calls to
+		// other 4-param functions, while __aNlrem calls __aNldiv.
+		List<Function> largeFuncs = new ArrayList<>();
+		for (Function func : fourParamFuncs) {
+			if (func == mulCandidate) continue;
+			long bodySize = func.getBody().getNumAddresses();
+			if (bodySize >= 80) {
+				largeFuncs.add(func);
+			}
+		}
+
+		if (largeFuncs.size() >= 2) {
+			// Check which one calls the other
+			for (Function f : largeFuncs) {
+				for (Function g : largeFuncs) {
+					if (f == g) continue;
+					// Does f call g?
+					if (callsFunction(f, g)) {
+						// f calls g: f is __aNlrem (calls __aNldiv), g is __aNldiv
+						remCandidate = f;
+						divCandidate = g;
+						break;
+					}
+				}
+				if (divCandidate != null) break;
+			}
+
+			// If neither calls the other, use address ordering:
+			// MSC links __aNldiv before __aNlrem
+			if (divCandidate == null && largeFuncs.size() == 2) {
+				Function first = largeFuncs.get(0);
+				Function second = largeFuncs.get(1);
+				if (first.getEntryPoint().compareTo(second.getEntryPoint()) < 0) {
+					divCandidate = first;
+					remCandidate = second;
+				} else {
+					divCandidate = second;
+					remCandidate = first;
+				}
+			}
+		} else if (largeFuncs.size() == 1) {
+			// Only one large function — could be either div or rem.
+			// Default to div since it's more common standalone.
+			divCandidate = largeFuncs.get(0);
+		}
+
+		if (mulCandidate != null) identified.put(mulCandidate, "aNlmul");
+		if (divCandidate != null) identified.put(divCandidate, "aNldiv");
+		if (remCandidate != null) identified.put(remCandidate, "aNlrem");
+
+		return identified;
+	}
+
+	/**
+	 * Check if function 'caller' contains a call to function 'callee'.
+	 */
+	private boolean callsFunction(Function caller, Function callee) {
+		var refs = currentProgram.getReferenceManager()
+			.getReferencesTo(callee.getEntryPoint());
+		while (refs.hasNext()) {
+			var ref = refs.next();
+			if (caller.getBody().contains(ref.getFromAddress())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	@Override
 	protected void run() throws Exception {
 		if (currentProgram == null) {
@@ -102,7 +275,59 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 
 		FunctionManager funcManager = currentProgram.getFunctionManager();
 		int fixedCount = 0;
+		int identifiedCount = 0;
 
+		// Phase 1: Try to identify unnamed functions by byte patterns
+		Memory memory = currentProgram.getMemory();
+		FunctionIterator allFunctions = funcManager.getFunctions(true);
+		while (allFunctions.hasNext() && !monitor.isCancelled()) {
+			Function func = allFunctions.next();
+			String name = func.getName();
+
+			// Skip already-named functions
+			if (!name.startsWith("FUN_")) {
+				continue;
+			}
+
+			String matched = matchBytePattern(func, memory);
+			if (matched != null) {
+				String newName = "__" + matched;
+				try {
+					func.setName(newName, SourceType.ANALYSIS);
+					println("Identified by bytes: " + name + " -> " + newName +
+						" at " + func.getEntryPoint());
+					identifiedCount++;
+				} catch (Exception e) {
+					println("  Warning: could not rename " + name + ": " + e.getMessage());
+				}
+			}
+		}
+
+		if (identifiedCount > 0) {
+			println("Identified " + identifiedCount + " function(s) by byte patterns.");
+		}
+
+		// Phase 1b: Structural identification for remaining unnamed functions
+		Map<Function, String> structMatches = identifyByStructure(funcManager);
+		for (Map.Entry<Function, String> entry : structMatches.entrySet()) {
+			Function func = entry.getKey();
+			String baseName = entry.getValue();
+			// Only rename if still unnamed
+			if (func.getName().startsWith("FUN_")) {
+				String newName = "__" + baseName;
+				try {
+					func.setName(newName, SourceType.ANALYSIS);
+					println("Identified by structure: " + func.getName() + " -> " + newName +
+						" at " + func.getEntryPoint() +
+						" (body=" + func.getBody().getNumAddresses() + " bytes)");
+					identifiedCount++;
+				} catch (Exception e) {
+					println("  Warning: could not rename: " + e.getMessage());
+				}
+			}
+		}
+
+		// Phase 2: Apply signatures to all named functions (including newly identified ones)
 		FunctionIterator functions = funcManager.getFunctions(true);
 		while (functions.hasNext() && !monitor.isCancelled()) {
 			Function func = functions.next();
@@ -166,7 +391,41 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 			}
 		}
 
-		println("\nDone. Fixed " + fixedCount + " function(s).");
+		println("\nDone. Identified " + identifiedCount + " by byte patterns, fixed " +
+			fixedCount + " signature(s).");
+	}
+
+	/**
+	 * Try to match a function's entry bytes against known MSC runtime patterns.
+	 * Returns the base name (e.g. "aNlmul") if matched, null otherwise.
+	 */
+	private String matchBytePattern(Function func, Memory memory) {
+		Address entry = func.getEntryPoint();
+
+		for (BytePattern pattern : BYTE_PATTERNS) {
+			try {
+				byte[] funcBytes = new byte[pattern.bytes.length];
+				int bytesRead = memory.getBytes(entry, funcBytes);
+				if (bytesRead < pattern.bytes.length) continue;
+
+				boolean match = true;
+				for (int i = 0; i < pattern.bytes.length; i++) {
+					if ((funcBytes[i] & pattern.mask[i]) != (pattern.bytes[i] & pattern.mask[i])) {
+						match = false;
+						break;
+					}
+				}
+				if (match) {
+					// Verify: also check the signature type exists
+					if (FUNC_SIGS.containsKey(pattern.name)) {
+						return pattern.name;
+					}
+				}
+			} catch (MemoryAccessException e) {
+				// Skip functions in non-readable memory
+			}
+		}
+		return null;
 	}
 
 	/**

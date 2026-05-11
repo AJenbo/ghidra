@@ -11654,10 +11654,11 @@ int4 RulePieceCarryAdd::applyOp(PcodeOp *op,Funcdata &data)
 
 /// \class RulePieceNegate
 /// \brief Collapse a 32-bit negate pattern feeding a PIECE:
-/// `PIECE(-(hi - zext(lo != 0)), -lo)` => `INT_2COMP(PIECE(hi, lo))`
+/// `PIECE(-(hi +/- zext(lo != 0)), -lo)` => `INT_2COMP(PIECE(hi, lo))`
 ///
-/// The pattern comes from the x86 `neg ax; sbb dx,0; neg dx` sequence for
-/// negating a 32-bit value in DX:AX.
+/// Handles two x86 compiler idioms for negating a 32-bit value in DX:AX:
+///   - `neg ax; sbb dx,0; neg dx` => `PIECE(-(hi - zext(lo!=0)), -lo)` (some compilers)
+///   - `neg ax; adc dx,0; neg dx` => `PIECE(-(hi + zext(lo!=0)), -lo)` (MSC 5.x)
 void RulePieceNegate::getOpList(vector<uint4> &oplist) const
 
 {
@@ -11718,9 +11719,13 @@ int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
   Varnode *hiInner = (Varnode *)0;
   if (!is2Comp(hiVn, hiInner)) return 0;
 
-  // hiInner should be: hi - zext(lo != 0)
-  // In p-code: INT_SUB(hi, zext(lo!=0))
-  // or: INT_ADD(hi, INT_MULT(zext(lo!=0), -1))
+  // hiInner should be one of:
+  //   hi - zext(lo != 0)   (neg/sbb/neg form)
+  //   hi + zext(lo != 0)   (neg/adc/neg form, MSC 5.x)
+  // In p-code:
+  //   INT_SUB(hi, zext(lo!=0))
+  //   INT_ADD(hi, INT_MULT(zext(lo!=0), -1))
+  //   INT_ADD(hi, zext(lo!=0))          <-- MSC 5.x form
   if (!hiInner->isWritten()) return 0;
   PcodeOp *hiInnerOp = hiInner->getDef();
   Varnode *hi = (Varnode *)0;
@@ -11731,10 +11736,10 @@ int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
     borrowVn = hiInnerOp->getIn(1);
   }
   else if (hiInnerOp->code() == CPUI_INT_ADD) {
-    // One of the inputs must be negated
     Varnode *a = hiInnerOp->getIn(0);
     Varnode *b = hiInnerOp->getIn(1);
     Varnode *negBase = (Varnode *)0;
+    // First try: INT_ADD(hi, -zext(lo!=0)) — the subtraction-via-add form
     if (is2Comp(b, negBase)) {
       hi = a;
       borrowVn = negBase;
@@ -11744,7 +11749,11 @@ int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
       borrowVn = negBase;
     }
     else {
-      return 0;
+      // Second: INT_ADD(hi, zext(lo!=0)) — the MSC 5.x neg/adc/neg form
+      // Both forms negate to the same result: -(hi ± carry) with carry = zext(lo!=0)
+      // Try b as borrowVn first (most common), fall back to a
+      hi = a;
+      borrowVn = b;
     }
   }
   else {
@@ -11752,19 +11761,40 @@ int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
   }
 
   // borrowVn should be ZEXT(lo != 0)
-  if (!borrowVn->isWritten()) return 0;
-  PcodeOp *zextOp = borrowVn->getDef();
-  if (zextOp->code() != CPUI_INT_ZEXT) return 0;
-  Varnode *cmpVn = zextOp->getIn(0);
-  if (!cmpVn->isWritten()) return 0;
-  PcodeOp *cmpOp = cmpVn->getDef();
-  if (cmpOp->code() != CPUI_INT_NOTEQUAL) return 0;
-  // Check: lo != 0
-  Varnode *cmpA = cmpOp->getIn(0);
-  Varnode *cmpB = cmpOp->getIn(1);
-  if (!((cmpA == lo && cmpB->isConstant() && cmpB->getOffset() == 0) ||
-        (cmpB == lo && cmpA->isConstant() && cmpA->getOffset() == 0)))
-    return 0;
+  // For the ADD case, if borrowVn doesn't match, try swapping hi and borrowVn
+  // (handles both orderings of the ADD inputs)
+  bool borrowMatched = false;
+  for (int4 attempt = 0; attempt < 2; ++attempt) {
+    if (borrowVn->isWritten()) {
+      PcodeOp *zextOp = borrowVn->getDef();
+      if (zextOp->code() == CPUI_INT_ZEXT) {
+        Varnode *cmpVn = zextOp->getIn(0);
+        if (cmpVn->isWritten()) {
+          PcodeOp *cmpOp = cmpVn->getDef();
+          if (cmpOp->code() == CPUI_INT_NOTEQUAL) {
+            Varnode *cmpA = cmpOp->getIn(0);
+            Varnode *cmpB = cmpOp->getIn(1);
+            if ((cmpA == lo && cmpB->isConstant() && cmpB->getOffset() == 0) ||
+                (cmpB == lo && cmpA->isConstant() && cmpA->getOffset() == 0)) {
+              borrowMatched = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+    // Only retry with swapped operands for the direct ADD case (not SUB or negated ADD)
+    if (attempt == 0 && hiInnerOp->code() == CPUI_INT_ADD) {
+      // Swap hi and borrowVn and try again
+      Varnode *tmp = hi;
+      hi = borrowVn;
+      borrowVn = tmp;
+    }
+    else {
+      break;
+    }
+  }
+  if (!borrowMatched) return 0;
 
   // Pattern matched! Transform:
   //   PIECE(neg_hi, neg_lo) => INT_2COMP(PIECE(hi, lo))
@@ -11782,6 +11812,69 @@ int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
   data.opRemoveInput(op, 1);
   data.opSetOpcode(op, CPUI_INT_2COMP);
   data.opSetInput(op, pieceOut, 0);
+
+  return 1;
+}
+
+/// \class RuleSubBoolZext
+/// \brief Simplify `1 - ZEXT(bool)` into `ZEXT(!bool)`
+///
+/// The pattern `INT_SUB(1, INT_ZEXT(boolval))` is equivalent to
+/// `INT_ZEXT(BOOL_NEGATE(boolval))`. This arises in MSC 5.x code for
+/// boolean flag tests like `(flags & bit) != 0` which get compiled as
+/// `1 - zext(flags & bit == 0)` producing ugly output like
+/// `(bool)('\x01' - ((a & b) == 0))`.
+void RuleSubBoolZext::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_INT_SUB);
+}
+
+int4 RuleSubBoolZext::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  // Match: INT_SUB(1, ZEXT(boolval))  or  INT_SUB(1, boolval) where boolval is boolean
+  Varnode *constVn = op->getIn(0);
+  if (!constVn->isConstant()) return 0;
+  if (constVn->getOffset() != 1) return 0;
+
+  Varnode *rhsVn = op->getIn(1);
+  Varnode *boolVn = (Varnode *)0;
+  bool hasZext = false;
+
+  // Case 1: INT_SUB(1, INT_ZEXT(boolval))
+  if (rhsVn->isWritten()) {
+    PcodeOp *rhsDef = rhsVn->getDef();
+    if (rhsDef->code() == CPUI_INT_ZEXT) {
+      Varnode *inner = rhsDef->getIn(0);
+      if (inner->isBooleanValue(data.isTypeRecoveryOn())) {
+        boolVn = inner;
+        hasZext = true;
+      }
+    }
+  }
+
+  // Case 2: INT_SUB(1, boolval) where boolval is directly boolean (same size)
+  if (boolVn == (Varnode *)0) {
+    if (rhsVn->isBooleanValue(data.isTypeRecoveryOn())) {
+      boolVn = rhsVn;
+    }
+  }
+
+  if (boolVn == (Varnode *)0) return 0;
+
+  // Transform: 1 - (zext(bool) or bool) => zext(!bool) or !bool
+  // Insert BOOL_NEGATE
+  PcodeOp *negOp = data.newOp(1, op->getAddr());
+  data.opSetOpcode(negOp, CPUI_BOOL_NEGATE);
+  Varnode *negOut = data.newUniqueOut(1, negOp);
+  data.opSetInput(negOp, boolVn, 0);
+  data.opInsertBefore(negOp, op);
+
+  // Transform SUB into ZEXT of negated bool
+  data.opRemoveInput(op, 1);
+  data.opSetOpcode(op, CPUI_INT_ZEXT);
+  data.opSetInput(op, negOut, 0);
 
   return 1;
 }

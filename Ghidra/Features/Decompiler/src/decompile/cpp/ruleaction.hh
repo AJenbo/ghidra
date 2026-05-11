@@ -1568,6 +1568,17 @@ public:
   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
 };
 
+class RuleSubBoolZext : public Rule {
+public:
+  RuleSubBoolZext(const string &g) : Rule(g, 0, "subboolzext") {}	///< Constructor
+  virtual Rule *clone(const ActionGroupList &grouplist) const {
+    if (!grouplist.contains(getGroup())) return (Rule *)0;
+    return new RuleSubBoolZext(getGroup());
+  }
+  virtual void getOpList(vector<uint4> &oplist) const;
+  virtual int4 applyOp(PcodeOp *op,Funcdata &data);
+};
+
 class RulePieceShiftLeft : public Rule {
 public:
   RulePieceShiftLeft(const string &g) : Rule(g, 0, "pieceshiftleft") {}	///< Constructor

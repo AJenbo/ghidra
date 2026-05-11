@@ -27,6 +27,9 @@ c97402ebf68b5e06
 <bytechunk space="ram" offset="0x1200" readonly="true">
 5589e58b46048b5606f7d883da00f7da5dc3
 </bytechunk>
+<bytechunk space="ram" offset="0x1220" readonly="true">
+5589e58b46048b5606f7d883d200f7da5dc3
+</bytechunk>
 <bytechunk space="ram" offset="0x1300" readonly="true">
 5589e58b46048b5606d1e0d1d25dc3
 </bytechunk>
@@ -51,6 +54,10 @@ c97402ebf68b5e06
 <bytechunk space="ram" offset="0x15a0" readonly="true">
 5589e58b46048b560689d1c1fa04c1e804c1e10c09c85dc3
 </bytechunk>
+<!-- Test case for boolean test_flag: and ax,[bp+6]; neg ax; sbb ax,ax; neg ax -->
+<bytechunk space="ram" offset="0x15c0" readonly="true">
+5589e58b4604234606f7d819c0f7d85dc3
+</bytechunk>
 <!-- Test 1: signdiv4 at 0x1000 - signed division by 4 using cwd/xor/sub/sar/xor/sub -->
 <symbol space="ram" offset="0x1000" name="signdiv4"/>
 <!-- Test 2: signdiv8 at 0x1020 - signed division by 8 -->
@@ -69,6 +76,10 @@ c97402ebf68b5e06
 <symbol space="ram" offset="0x1120" name="sub_long_ret"/>
 <!-- Test 9: neg_long_ret at 0x1200 - 32-bit negate via neg/sbb/neg returning in DX:AX -->
 <symbol space="ram" offset="0x1200" name="neg_long_ret"/>
+<!-- Test 18: neg_long_adc at 0x1220 - 32-bit negate via neg/adc/neg (MSC 5.x form) -->
+<symbol space="ram" offset="0x1220" name="neg_long_adc"/>
+<!-- Test 19: testflag at 0x15c0 - boolean test_flag via neg/sbb/neg -->
+<symbol space="ram" offset="0x15c0" name="testflag"/>
 <!-- Test 10: shl32_1_ret at 0x1300 - 32-bit left shift by 1 via shl/rcl -->
 <symbol space="ram" offset="0x1300" name="shl32_1_ret"/>
 <!-- Test 11: shr32_1_ret at 0x1400 - 32-bit unsigned right shift by 1 via shr/rcr -->
@@ -172,6 +183,16 @@ c97402ebf68b5e06
   <com>lo fu sar4_32</com>
   <com>decompile</com>
   <com>print C</com>
+  <!-- Test 18: 32-bit negate via neg/adc/neg (MSC 5.x) -->
+  <com>parse line extern int4 neg_long_adc(int2 lo, int2 hi);</com>
+  <com>lo fu neg_long_adc</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <!-- Test 19: Boolean test_flag -->
+  <com>parse line extern uint2 testflag(uint2 flags, uint2 bit);</com>
+  <com>lo fu testflag</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <!-- Test 1: Signed division by 4 should produce / 4, not the xor/sub mess -->
@@ -191,8 +212,12 @@ c97402ebf68b5e06
 <stringmatch name="AddLong" min="1" max="1">CONCAT22.*\+.*CONCAT22</stringmatch>
 <!-- Test 8: 32-bit sub should produce CONCAT - CONCAT, not borrow mess -->
 <stringmatch name="SubLong" min="1" max="1">CONCAT22.*-.*CONCAT22</stringmatch>
-<!-- Test 9: 32-bit negate should produce -CONCAT22 -->
-<stringmatch name="NegLong" min="1" max="1">-CONCAT22</stringmatch>
+<!-- Test 9: 32-bit negate should produce -CONCAT22 (matched in both neg_long_ret and neg_long_adc) -->
+<stringmatch name="NegLong" min="2" max="2">-CONCAT22</stringmatch>
+<!-- (NegLongAdc is covered by NegLong count=2 above) -->
+<!-- Test 19: testflag should produce != 0 or & pattern, not 1 - (x == 0) -->
+<stringmatch name="TestFlagExists" min="1" max="1">testflag</stringmatch>
+<stringmatch name="TestFlagClean" min="1" max="1">flags &amp; bit</stringmatch>
 <!-- Test 10: 32-bit shift left should produce << 1 -->
 <stringmatch name="ShiftLeft32" min="1" max="1">CONCAT22.*&lt;&lt; 1</stringmatch>
 <!-- Test 11: 32-bit right shift should produce >> 1 -->
