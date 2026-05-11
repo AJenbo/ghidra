@@ -59,14 +59,18 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 
 	/** Signature types for MSC runtime functions */
 	private enum SigType {
-		/** long func(long a, long b) */
+		/** long func(long a, long b) — stack-based */
 		LONG_LONG_LONG,
-		/** void func(long *a, long b) - in-place operation */
+		/** void func(long *a, long b) — in-place operation, stack-based */
 		VOID_LONGPTR_LONG,
-		/** long func(long val, int count) - shift operation */
+		/** long func(long val, int count) — stack-based shift (if exists) */
 		LONG_LONG_INT,
-		/** unsigned long func(unsigned long val, int count) - unsigned shift */
-		ULONG_ULONG_INT
+		/** unsigned long func(unsigned long val, int count) — stack-based shift (if exists) */
+		ULONG_ULONG_INT,
+		/** Shift helper — register-based, just fix return type to long */
+		RETURN_LONG_ONLY,
+		/** Shift helper — register-based, just fix return type to unsigned long */
+		RETURN_ULONG_ONLY
 	}
 
 	/** Map of function base names (without prefix) to their signature type */
@@ -83,10 +87,10 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 		FUNC_SIGS.put("aFlmul", SigType.LONG_LONG_LONG);
 		FUNC_SIGS.put("aFldiv", SigType.LONG_LONG_LONG);
 		FUNC_SIGS.put("aFlrem", SigType.LONG_LONG_LONG);
-		// Shift helpers
-		FUNC_SIGS.put("aFNalshl", SigType.LONG_LONG_INT);
-		FUNC_SIGS.put("aFNalshr", SigType.ULONG_ULONG_INT);
-		FUNC_SIGS.put("aFNalsar", SigType.LONG_LONG_INT);
+		// Shift helpers — register-based calling convention, just fix return type
+		FUNC_SIGS.put("aFNalshl", SigType.RETURN_LONG_ONLY);
+		FUNC_SIGS.put("aFNalshr", SigType.RETURN_ULONG_ONLY);
+		FUNC_SIGS.put("aFNalsar", SigType.RETURN_LONG_ONLY);
 	}
 
 	/**
@@ -131,6 +135,93 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 		// Add patterns here as they are identified from specific binaries.
 		// See script description for format.
 	};
+
+	/**
+	 * Heuristic: identify likely long-shift runtime functions by their
+	 * structural properties. Shift helpers (__aFNalshl, __aFNalshr, __aFNalsar)
+	 * use a register-based calling convention (value in DX:AX, count in CL).
+	 * Ghidra's auto-analysis typically detects 0 stack parameters since the
+	 * values are passed in registers. These are small functions (typically
+	 * 15-50 bytes) called from multiple sites.
+	 *
+	 * Classification:
+	 * - All three are similar size. We distinguish by instruction patterns:
+	 *   - __aFNalshl: contains SHL + RCL (shift left with carry propagation)
+	 *   - __aFNalshr: contains SHR + RCR (unsigned shift right with carry)
+	 *   - __aFNalsar: contains SAR + RCR (signed/arithmetic shift right with carry)
+	 * - If instruction analysis fails, we fall back to address ordering
+	 *   (MSC links shl, then shr, then sar).
+	 */
+	private Map<Function, String> identifyShiftHelpers(FunctionManager funcManager) {
+		Map<Function, String> identified = new LinkedHashMap<>();
+
+		FunctionIterator iter = funcManager.getFunctions(true);
+		while (iter.hasNext() && !monitor.isCancelled()) {
+			Function func = iter.next();
+			if (!func.getName().startsWith("FUN_")) continue;
+
+			// Shift helpers use register-based calling convention:
+			// value in DX:AX, count in CL. Ghidra's auto-analysis typically
+			// detects 0 stack parameters (registers aren't seen as params).
+			// Accept 0-3 detected params to be safe.
+			Parameter[] params = func.getParameters();
+			if (params.length > 3) continue;
+
+			// Must be small (shift helpers are ~15-50 bytes)
+			long bodySize = func.getBody().getNumAddresses();
+			if (bodySize > 60) continue;
+
+			// Must be called from at least 2 sites
+			int callCount = 0;
+			var refs = currentProgram.getReferenceManager()
+				.getReferencesTo(func.getEntryPoint());
+			while (refs.hasNext()) {
+				refs.next();
+				callCount++;
+			}
+			if (callCount < 2) continue;
+
+			// The defining feature: must contain shift+rotate instruction pairs
+			String name = classifyShiftByInstructions(func);
+			if (name != null) {
+				identified.put(func, name);
+			}
+		}
+
+		return identified;
+	}
+
+	/**
+	 * Classify a shift helper by scanning its instructions for SHL/SHR/SAR + RCL/RCR.
+	 * Returns the base name (e.g. "aFNalshl") or null if unrecognized.
+	 */
+	private String classifyShiftByInstructions(Function func) {
+		boolean hasSHL = false, hasSHR = false, hasSAR = false;
+		boolean hasRCL = false, hasRCR = false;
+
+		InstructionIterator instrIter = currentProgram.getListing()
+			.getInstructions(func.getBody(), true);
+		while (instrIter.hasNext()) {
+			Instruction instr = instrIter.next();
+			String mnemonic = instr.getMnemonicString().toUpperCase();
+			switch (mnemonic) {
+				case "SHL": hasSHL = true; break;
+				case "SHR": hasSHR = true; break;
+				case "SAR": hasSAR = true; break;
+				case "RCL": hasRCL = true; break;
+				case "RCR": hasRCR = true; break;
+			}
+		}
+
+		// SHL + RCL = left shift
+		if (hasSHL && hasRCL) return "aFNalshl";
+		// SAR + RCR = arithmetic (signed) right shift
+		if (hasSAR && hasRCR) return "aFNalsar";
+		// SHR + RCR = logical (unsigned) right shift
+		if (hasSHR && hasRCR) return "aFNalshr";
+
+		return null;
+	}
 
 	/**
 	 * Heuristic: identify likely long-arithmetic runtime functions by their
@@ -308,6 +399,7 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 		}
 
 		// Phase 1b: Structural identification for remaining unnamed functions
+		// First: identify mul/div/rem (4 word params)
 		Map<Function, String> structMatches = identifyByStructure(funcManager);
 		for (Map.Entry<Function, String> entry : structMatches.entrySet()) {
 			Function func = entry.getKey();
@@ -318,6 +410,25 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 				try {
 					func.setName(newName, SourceType.ANALYSIS);
 					println("Identified by structure: " + func.getName() + " -> " + newName +
+						" at " + func.getEntryPoint() +
+						" (body=" + func.getBody().getNumAddresses() + " bytes)");
+					identifiedCount++;
+				} catch (Exception e) {
+					println("  Warning: could not rename: " + e.getMessage());
+				}
+			}
+		}
+
+		// Phase 1c: Structural identification for shift helpers (3 word params)
+		Map<Function, String> shiftMatches = identifyShiftHelpers(funcManager);
+		for (Map.Entry<Function, String> entry : shiftMatches.entrySet()) {
+			Function func = entry.getKey();
+			String baseName = entry.getValue();
+			if (func.getName().startsWith("FUN_")) {
+				String newName = "__" + baseName;
+				try {
+					func.setName(newName, SourceType.ANALYSIS);
+					println("Identified shift helper: " + func.getName() + " -> " + newName +
 						" at " + func.getEntryPoint() +
 						" (body=" + func.getBody().getNumAddresses() + " bytes)");
 					identifiedCount++;
@@ -342,12 +453,15 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 			println("Found: " + name + " at " + func.getEntryPoint() + " -> " + sigType);
 
 			try {
-				// Set calling convention
-				try {
-					func.setCallingConvention(CC_CDECL);
-				}
-				catch (Exception e) {
-					println("  Warning: could not set calling convention: " + e.getMessage());
+				// Set calling convention (skip for return-type-only shift helpers)
+				if (sigType != SigType.RETURN_LONG_ONLY &&
+					sigType != SigType.RETURN_ULONG_ONLY) {
+					try {
+						func.setCallingConvention(CC_CDECL);
+					}
+					catch (Exception e) {
+						println("  Warning: could not set calling convention: " + e.getMessage());
+					}
 				}
 
 				List<Parameter> params = new ArrayList<>();
@@ -374,6 +488,16 @@ public class FixMsc16BitRuntimeSignatures extends GhidraScript {
 						params.add(new ParameterImpl("val", ulongType, currentProgram));
 						params.add(new ParameterImpl("count", intType, currentProgram));
 						break;
+					case RETURN_LONG_ONLY:
+					case RETURN_ULONG_ONLY:
+						// Only fix the return type — don't touch params or calling convention.
+						// These are register-based functions (val in DX:AX, count in CL).
+						// Setting custom storage causes register pollution in callers.
+						retType = (sigType == SigType.RETURN_LONG_ONLY) ? longType : ulongType;
+						func.setReturnType(retType, SourceType.USER_DEFINED);
+						println("  Applied return type: " + retType.getDisplayName() + " " + name + "(...)");
+						fixedCount++;
+						continue;
 					default:
 						continue;
 				}
