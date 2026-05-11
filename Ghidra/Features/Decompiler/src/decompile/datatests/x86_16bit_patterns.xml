@@ -45,6 +45,12 @@ c97402ebf68b5e06
 <bytechunk space="ram" offset="0x1560" readonly="true">
 5589e58b46048b560689d1c1e804c1ea04c1e10c09c85dc3
 </bytechunk>
+<bytechunk space="ram" offset="0x1580" readonly="true">
+5589e58b46048b5606d1fad1d85dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x15a0" readonly="true">
+5589e58b46048b560689d1c1fa04c1e804c1e10c09c85dc3
+</bytechunk>
 <!-- Test 1: signdiv4 at 0x1000 - signed division by 4 using cwd/xor/sub/sar/xor/sub -->
 <symbol space="ram" offset="0x1000" name="signdiv4"/>
 <!-- Test 2: signdiv8 at 0x1020 - signed division by 8 -->
@@ -75,6 +81,10 @@ c97402ebf68b5e06
 <symbol space="ram" offset="0x1540" name="shl4_32"/>
 <!-- Test 15: shr4_32 at 0x1560 - 32-bit right shift by 4 (expression tree) -->
 <symbol space="ram" offset="0x1560" name="shr4_32"/>
+<!-- Test 16: sar1_32 at 0x1580 - signed 32-bit arithmetic right shift by 1 -->
+<symbol space="ram" offset="0x1580" name="sar1_32"/>
+<!-- Test 17: sar4_32 at 0x15a0 - signed 32-bit arithmetic right shift by 4 -->
+<symbol space="ram" offset="0x15a0" name="sar4_32"/>
 </binaryimage>
 <script>
   <!-- Test 1: Signed division by 4 -->
@@ -152,6 +162,16 @@ c97402ebf68b5e06
   <com>lo fu shr4_32</com>
   <com>decompile</com>
   <com>print C</com>
+  <!-- Test 16: Signed 32-bit arithmetic right shift by 1 -->
+  <com>parse line extern int4 sar1_32(int2 lo, int2 hi);</com>
+  <com>lo fu sar1_32</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <!-- Test 17: Signed 32-bit arithmetic right shift by 4 -->
+  <com>parse line extern int4 sar4_32(int2 lo, int2 hi);</com>
+  <com>lo fu sar4_32</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <!-- Test 1: Signed division by 4 should produce / 4, not the xor/sub mess -->
@@ -176,13 +196,16 @@ c97402ebf68b5e06
 <!-- Test 10: 32-bit shift left should produce << 1 -->
 <stringmatch name="ShiftLeft32" min="1" max="1">CONCAT22.*&lt;&lt; 1</stringmatch>
 <!-- Test 11: 32-bit right shift should produce >> 1 -->
-<stringmatch name="ShiftRight32" min="1" max="1">CONCAT22.*>> 1</stringmatch>
+<stringmatch name="ShiftRight32" min="1" max="2">CONCAT22.*>> 1</stringmatch>
 <!-- Test 12: Signed division by 2 -->
 <stringmatch name="SignedDiv2" min="1" max="1">/ 2</stringmatch>
 <!-- Test 13: Signed division by 16 -->
 <stringmatch name="SignedDiv16" min="1" max="1">/ 0x10</stringmatch>
 <!-- Test 14: 32-bit left shift by 4 -->
 <stringmatch name="ShiftLeft32_4" min="1" max="1">CONCAT22.*&lt;&lt; 4</stringmatch>
-<!-- Test 15: 32-bit right shift by 4 -->
-<stringmatch name="ShiftRight32_4" min="1" max="1">CONCAT22.*>> 4</stringmatch>
+<!-- Test 15: 32-bit right shift by 4 (matches both unsigned and signed) -->
+<stringmatch name="ShiftRight32_4" min="1" max="2">CONCAT22.*>> 4</stringmatch>
+<!-- Test 16: Signed 32-bit arithmetic right shift by 1 (also counted in unsigned shift-by-1 test) -->
+<stringmatch name="SignedShiftRight32_1" min="2" max="2">CONCAT22.*>> 1</stringmatch>
+<!-- Test 17: Signed 32-bit arithmetic right shift by 4 is covered by ShiftRight32_4 above -->
 </decompilertest>
