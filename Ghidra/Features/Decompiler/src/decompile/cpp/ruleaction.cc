@@ -11652,4 +11652,138 @@ int4 RulePieceCarryAdd::applyOp(PcodeOp *op,Funcdata &data)
   return 1;
 }
 
+/// \class RulePieceNegate
+/// \brief Collapse a 32-bit negate pattern feeding a PIECE:
+/// `PIECE(-(hi - zext(lo != 0)), -lo)` => `INT_2COMP(PIECE(hi, lo))`
+///
+/// The pattern comes from the x86 `neg ax; sbb dx,0; neg dx` sequence for
+/// negating a 32-bit value in DX:AX.
+void RulePieceNegate::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_PIECE);
+}
+
+/// Helper: check if \b vn is the two's complement (negation) of \b base.
+/// Returns \b true if vn = -base in one of these forms:
+///   - INT_2COMP(base)
+///   - INT_MULT(base, -1)
+///   - INT_SUB(0, base)
+static bool is2Comp(Varnode *vn,Varnode *&base)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *def = vn->getDef();
+  if (def->code() == CPUI_INT_2COMP) {
+    base = def->getIn(0);
+    return true;
+  }
+  if (def->code() == CPUI_INT_MULT) {
+    Varnode *a = def->getIn(0);
+    Varnode *b = def->getIn(1);
+    uintb mask = calc_mask(vn->getSize());
+    if (b->isConstant() && b->getOffset() == mask) {
+      base = a;
+      return true;
+    }
+    if (a->isConstant() && a->getOffset() == mask) {
+      base = b;
+      return true;
+    }
+    return false;
+  }
+  if (def->code() == CPUI_INT_SUB) {
+    if (def->getIn(0)->isConstant() && def->getIn(0)->getOffset() == 0) {
+      base = def->getIn(1);
+      return true;
+    }
+  }
+  return false;
+}
+
+int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  // Match: PIECE(neg_hi, neg_lo) where
+  //   neg_lo = -lo
+  //   neg_hi = -(hi - zext(lo != 0))
+  Varnode *hiVn = op->getIn(0);
+  Varnode *loVn = op->getIn(1);
+
+  // Match neg_lo = -lo
+  Varnode *lo = (Varnode *)0;
+  if (!is2Comp(loVn, lo)) return 0;
+
+  // Match neg_hi = -(hi - zext(lo != 0))
+  Varnode *hiInner = (Varnode *)0;
+  if (!is2Comp(hiVn, hiInner)) return 0;
+
+  // hiInner should be: hi - zext(lo != 0)
+  // In p-code: INT_SUB(hi, zext(lo!=0))
+  // or: INT_ADD(hi, INT_MULT(zext(lo!=0), -1))
+  if (!hiInner->isWritten()) return 0;
+  PcodeOp *hiInnerOp = hiInner->getDef();
+  Varnode *hi = (Varnode *)0;
+  Varnode *borrowVn = (Varnode *)0;
+
+  if (hiInnerOp->code() == CPUI_INT_SUB) {
+    hi = hiInnerOp->getIn(0);
+    borrowVn = hiInnerOp->getIn(1);
+  }
+  else if (hiInnerOp->code() == CPUI_INT_ADD) {
+    // One of the inputs must be negated
+    Varnode *a = hiInnerOp->getIn(0);
+    Varnode *b = hiInnerOp->getIn(1);
+    Varnode *negBase = (Varnode *)0;
+    if (is2Comp(b, negBase)) {
+      hi = a;
+      borrowVn = negBase;
+    }
+    else if (is2Comp(a, negBase)) {
+      hi = b;
+      borrowVn = negBase;
+    }
+    else {
+      return 0;
+    }
+  }
+  else {
+    return 0;
+  }
+
+  // borrowVn should be ZEXT(lo != 0)
+  if (!borrowVn->isWritten()) return 0;
+  PcodeOp *zextOp = borrowVn->getDef();
+  if (zextOp->code() != CPUI_INT_ZEXT) return 0;
+  Varnode *cmpVn = zextOp->getIn(0);
+  if (!cmpVn->isWritten()) return 0;
+  PcodeOp *cmpOp = cmpVn->getDef();
+  if (cmpOp->code() != CPUI_INT_NOTEQUAL) return 0;
+  // Check: lo != 0
+  Varnode *cmpA = cmpOp->getIn(0);
+  Varnode *cmpB = cmpOp->getIn(1);
+  if (!((cmpA == lo && cmpB->isConstant() && cmpB->getOffset() == 0) ||
+        (cmpB == lo && cmpA->isConstant() && cmpA->getOffset() == 0)))
+    return 0;
+
+  // Pattern matched! Transform:
+  //   PIECE(neg_hi, neg_lo) => INT_2COMP(PIECE(hi, lo))
+  int4 wholesize = hi->getSize() + lo->getSize();
+
+  // Create PIECE(hi, lo)
+  PcodeOp *pieceOp = data.newOp(2, op->getAddr());
+  data.opSetOpcode(pieceOp, CPUI_PIECE);
+  Varnode *pieceOut = data.newUniqueOut(wholesize, pieceOp);
+  data.opSetInput(pieceOp, hi, 0);
+  data.opSetInput(pieceOp, lo, 1);
+  data.opInsertBefore(pieceOp, op);
+
+  // Transform original PIECE into INT_2COMP
+  data.opRemoveInput(op, 1);
+  data.opSetOpcode(op, CPUI_INT_2COMP);
+  data.opSetInput(op, pieceOut, 0);
+
+  return 1;
+}
+
 } // End namespace ghidra
