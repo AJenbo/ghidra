@@ -383,20 +383,48 @@ public class MzLoader extends AbstractLibrarySupportLoader {
 			return;
 		}
 
-		// TODO: can better do this in an analyzer on the entry point
-		//       might work in some cases.
+		// Scan the first few bytes near the entry point for common patterns that
+		// set the DS register. Many MZ executables use one of these sequences:
+		//   1. mov dx, imm16  (0xBA XX XX) - original check
+		//   2. mov ax, imm16; mov ds, ax  (0xB8 XX XX 0x8E 0xD8)
+		//   3. mov ax, imm16; ... mov ds, ax  (within first ~20 bytes)
 		DataConverter converter = LittleEndianDataConverter.INSTANCE;
 		boolean shouldSetDS = false;
 		long dsValue = 0;
 		try {
 			for (MemoryBlock block : program.getMemory().getBlocks()) {
 				if (block.contains(entry.getAddress())) {
-					byte instByte = block.getByte(entry.getAddress());
-					if (instByte == MOVW_DS_OPCODE) { //is instruction "movw %dx,$0x1234"
-						byte[] dsBytes = new byte[2];
-						block.getBytes(entry.getAddress().addWrap(1), dsBytes);
-						dsValue = converter.getShort(dsBytes);
+					// Read up to 256 bytes from the entry point to scan for DS setup.
+					// The C runtime startup code (CRT0) often performs DOS version checks,
+					// memory setup, etc. before setting DS, so we need a wide scan window.
+					int scanLen = (int) Math.min(256, block.getEnd().subtract(entry.getAddress()) + 1);
+					byte[] entryBytes = new byte[scanLen];
+					block.getBytes(entry.getAddress(), entryBytes);
+
+					// Pattern 1: mov dx, imm16 (0xBA XX XX) at offset 0
+					if (scanLen >= 3 && entryBytes[0] == MOVW_DS_OPCODE) {
+						dsValue = converter.getShort(entryBytes, 1);
 						shouldSetDS = true;
+					}
+
+					// Pattern 2: scan for mov ax, imm16 (0xB8 XX XX) followed
+					// eventually by mov ds, ax (0x8E 0xD8) within the scan window
+					if (!shouldSetDS) {
+						for (int i = 0; i < scanLen - 4; i++) {
+							if (entryBytes[i] == (byte) 0xB8) { // mov ax, imm16
+								long candidate = converter.getShort(entryBytes, i + 1);
+								// Look for mov ds, ax (0x8E 0xD8) after this instruction
+								for (int j = i + 3; j < scanLen - 1; j++) {
+									if (entryBytes[j] == (byte) 0x8E &&
+											entryBytes[j + 1] == (byte) 0xD8) {
+										dsValue = candidate;
+										shouldSetDS = true;
+										break;
+									}
+								}
+								if (shouldSetDS) break;
+							}
+						}
 					}
 					break;
 				}
