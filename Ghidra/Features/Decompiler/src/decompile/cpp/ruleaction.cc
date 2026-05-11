@@ -5331,6 +5331,12 @@ int4 RulePieceAddSub::applyOp(PcodeOp *op,Funcdata &data)
     Varnode *root = subAdd->getIn(0);
     if (root != subOther->getIn(0)) continue;
 
+    // Do not collapse if root is address-tied (memory location) or written via INDIRECT,
+    // as the PIECE tracks a partial write that must be preserved for SSA correctness.
+    if (root->isAddrTied()) continue;
+    if (root->isPersist()) continue;
+    if (root->isWritten() && root->getDef()->code() == CPUI_INDIRECT) continue;
+
     int4 addSubOff = (int4)subAdd->getIn(1)->getOffset();
     int4 otherOff = (int4)subOther->getIn(1)->getOffset();
     int4 addSize = vnAdd->getSize();
