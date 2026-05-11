@@ -33,6 +33,18 @@ c97402ebf68b5e06
 <bytechunk space="ram" offset="0x1400" readonly="true">
 5589e58b46048b5606d1ead1d85dc3
 </bytechunk>
+<bytechunk space="ram" offset="0x1500" readonly="true">
+5589e58b46049931d029d0d1f831d029d05dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x1520" readonly="true">
+5589e58b46049931d029d0c1f80431d029d05dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x1540" readonly="true">
+5589e58b46048b560689c1c1e004c1e204c1e90c09ca5dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x1560" readonly="true">
+5589e58b46048b560689d1c1e804c1ea04c1e10c09c85dc3
+</bytechunk>
 <!-- Test 1: signdiv4 at 0x1000 - signed division by 4 using cwd/xor/sub/sar/xor/sub -->
 <symbol space="ram" offset="0x1000" name="signdiv4"/>
 <!-- Test 2: signdiv8 at 0x1020 - signed division by 8 -->
@@ -55,6 +67,14 @@ c97402ebf68b5e06
 <symbol space="ram" offset="0x1300" name="shl32_1_ret"/>
 <!-- Test 11: shr32_1_ret at 0x1400 - 32-bit unsigned right shift by 1 via shr/rcr -->
 <symbol space="ram" offset="0x1400" name="shr32_1_ret"/>
+<!-- Test 12: sdiv2 at 0x1500 - signed division by 2 -->
+<symbol space="ram" offset="0x1500" name="sdiv2"/>
+<!-- Test 13: sdiv16 at 0x1520 - signed division by 16 -->
+<symbol space="ram" offset="0x1520" name="sdiv16"/>
+<!-- Test 14: shl4_32 at 0x1540 - 32-bit left shift by 4 (expression tree) -->
+<symbol space="ram" offset="0x1540" name="shl4_32"/>
+<!-- Test 15: shr4_32 at 0x1560 - 32-bit right shift by 4 (expression tree) -->
+<symbol space="ram" offset="0x1560" name="shr4_32"/>
 </binaryimage>
 <script>
   <!-- Test 1: Signed division by 4 -->
@@ -112,6 +132,26 @@ c97402ebf68b5e06
   <com>lo fu shr32_1_ret</com>
   <com>decompile</com>
   <com>print C</com>
+  <!-- Test 12: Signed division by 2 -->
+  <com>parse line extern int2 sdiv2(int2 x);</com>
+  <com>lo fu sdiv2</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <!-- Test 13: Signed division by 16 -->
+  <com>parse line extern int2 sdiv16(int2 x);</com>
+  <com>lo fu sdiv16</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <!-- Test 14: 32-bit left shift by 4 -->
+  <com>parse line extern int4 shl4_32(int2 lo, int2 hi);</com>
+  <com>lo fu shl4_32</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <!-- Test 15: 32-bit right shift by 4 -->
+  <com>parse line extern uint4 shr4_32(uint2 lo, uint2 hi);</com>
+  <com>lo fu shr4_32</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <!-- Test 1: Signed division by 4 should produce / 4, not the xor/sub mess -->
@@ -137,4 +177,12 @@ c97402ebf68b5e06
 <stringmatch name="ShiftLeft32" min="1" max="1">CONCAT22.*&lt;&lt; 1</stringmatch>
 <!-- Test 11: 32-bit right shift should produce >> 1 -->
 <stringmatch name="ShiftRight32" min="1" max="1">CONCAT22.*>> 1</stringmatch>
+<!-- Test 12: Signed division by 2 -->
+<stringmatch name="SignedDiv2" min="1" max="1">/ 2</stringmatch>
+<!-- Test 13: Signed division by 16 -->
+<stringmatch name="SignedDiv16" min="1" max="1">/ 0x10</stringmatch>
+<!-- Test 14: 32-bit left shift by 4 -->
+<stringmatch name="ShiftLeft32_4" min="1" max="1">CONCAT22.*&lt;&lt; 4</stringmatch>
+<!-- Test 15: 32-bit right shift by 4 -->
+<stringmatch name="ShiftRight32_4" min="1" max="1">CONCAT22.*>> 4</stringmatch>
 </decompilertest>
