@@ -11786,4 +11786,127 @@ int4 RulePieceNegate::applyOp(PcodeOp *op,Funcdata &data)
   return 1;
 }
 
+/// \class RulePieceShiftLeft
+/// \brief Collapse a carry-propagation left shift feeding a PIECE:
+/// `PIECE((hi << N) | (lo >> (K-N)), lo << N)` => `PIECE(hi, lo) << N`
+///
+/// Also handles the special case where N=1 and the carry is extracted as:
+/// `hi << 1 | ZEXT(lo < 0)` (since lo < 0 tests the MSB = carry out of lo << 1)
+void RulePieceShiftLeft::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_PIECE);
+}
+
+/// Helper: check if \b vn is `base >> (pieceSize*8 - N)`, extracting the top N bits.
+/// If matched, set \b base and \b shiftAmt and return true.
+/// Also matches ZEXT(INT_SLESS(base, 0)) for the N=1 case (MSB extraction).
+static bool isCarryExtract(Varnode *vn, int4 pieceSize, Varnode *&base, int4 &shiftAmt)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *def = vn->getDef();
+
+  // Form 1: ZEXT(INT_SLESS(base, 0)) — MSB extraction for N=1
+  if (def->code() == CPUI_INT_ZEXT) {
+    Varnode *boolVn = def->getIn(0);
+    if (!boolVn->isWritten()) return false;
+    PcodeOp *boolOp = boolVn->getDef();
+    if (boolOp->code() == CPUI_INT_SLESS) {
+      if (boolOp->getIn(1)->isConstant() && boolOp->getIn(1)->getOffset() == 0) {
+        base = boolOp->getIn(0);
+        shiftAmt = 1;
+        return true;
+      }
+    }
+    // Form 1b: ZEXT(INT_LESS(const, base)) where const = 2^(K-1) - 1, i.e. base >= 2^(K-1)
+    // This is another way to test MSB. Actually it's (base >> 15) cast to bool.
+    return false;
+  }
+
+  // Form 2: INT_RIGHT(base, K-N) or INT_SRIGHT(base, K-N)
+  if (def->code() == CPUI_INT_RIGHT || def->code() == CPUI_INT_SRIGHT) {
+    Varnode *saVn = def->getIn(1);
+    if (!saVn->isConstant()) return false;
+    int4 K = pieceSize * 8;
+    int4 sa = (int4)saVn->getOffset();
+    if (sa <= 0 || sa >= K) return false;
+    base = def->getIn(0);
+    shiftAmt = K - sa;  // N = K - sa
+    return true;
+  }
+
+  return false;
+}
+
+int4 RulePieceShiftLeft::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  // Match: PIECE(hi_result, lo_result) where
+  //   lo_result = lo << N
+  //   hi_result = (hi << N) | carryExtract(lo, N)
+  Varnode *hiVn = op->getIn(0);
+  Varnode *loVn = op->getIn(1);
+
+  // lo_result must be a left shift by constant
+  if (!loVn->isWritten()) return 0;
+  PcodeOp *loOp = loVn->getDef();
+  if (loOp->code() != CPUI_INT_LEFT) return 0;
+  Varnode *lo = loOp->getIn(0);
+  Varnode *loSaVn = loOp->getIn(1);
+  if (!loSaVn->isConstant()) return 0;
+  int4 N = (int4)loSaVn->getOffset();
+  if (N <= 0) return 0;
+  int4 pieceSize = lo->getSize();
+  if (N >= pieceSize * 8) return 0;
+
+  // hi_result must be: (hi << N) | carryExtract(lo, N)
+  if (!hiVn->isWritten()) return 0;
+  PcodeOp *hiOp = hiVn->getDef();
+  if (hiOp->code() != CPUI_INT_OR) return 0;
+
+  // Try both orderings of OR
+  for (int4 i = 0; i < 2; ++i) {
+    Varnode *orA = hiOp->getIn(i);
+    Varnode *orB = hiOp->getIn(1 - i);
+
+    // orA should be hi << N
+    if (!orA->isWritten()) continue;
+    PcodeOp *hiShOp = orA->getDef();
+    if (hiShOp->code() != CPUI_INT_LEFT) continue;
+    Varnode *hiSaVn = hiShOp->getIn(1);
+    if (!hiSaVn->isConstant()) continue;
+    if ((int4)hiSaVn->getOffset() != N) continue;
+    Varnode *hi = hiShOp->getIn(0);
+
+    // orB should be carry extract from lo with shift amount N
+    Varnode *carryBase = (Varnode *)0;
+    int4 carryN = 0;
+    if (!isCarryExtract(orB, pieceSize, carryBase, carryN)) continue;
+    if (carryN != N) continue;
+    if (carryBase != lo) continue;
+
+    // Pattern matched! Transform:
+    //   PIECE(hi_result, lo_result) => PIECE(hi, lo) << N
+    int4 wholesize = hi->getSize() + lo->getSize();
+
+    // Create PIECE(hi, lo)
+    PcodeOp *pieceOp = data.newOp(2, op->getAddr());
+    data.opSetOpcode(pieceOp, CPUI_PIECE);
+    Varnode *pieceOut = data.newUniqueOut(wholesize, pieceOp);
+    data.opSetInput(pieceOp, hi, 0);
+    data.opSetInput(pieceOp, lo, 1);
+    data.opInsertBefore(pieceOp, op);
+
+    // Transform original PIECE into INT_LEFT
+    data.opSetOpcode(op, CPUI_INT_LEFT);
+    data.opSetInput(op, pieceOut, 0);
+    data.opSetInput(op, data.newConstant(4, (uintb)N), 1);
+
+    return 1;
+  }
+
+  return 0;
+}
+
 } // End namespace ghidra
