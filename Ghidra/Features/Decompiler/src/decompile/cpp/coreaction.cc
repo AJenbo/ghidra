@@ -5678,6 +5678,7 @@ void ActionDatabase::universalAction(Architecture *conf)
 	actprop->addRule( new RuleSubCancel("analysis") );
 	actprop->addRule( new RuleShiftSub("analysis") );
 	actprop->addRule( new RuleHumptyDumpty("analysis") );
+	actprop->addRule( new RulePieceAddSub("analysis") );
 	actprop->addRule( new RuleDumptyHump("analysis") );
 	actprop->addRule( new RuleHumptyOr("analysis") );
 	actprop->addRule( new RuleNegateIdentity("analysis") );
@@ -5689,6 +5690,7 @@ void ActionDatabase::universalAction(Architecture *conf)
 	actprop->addRule( new RuleSignForm("analysis") );
 	actprop->addRule( new RuleSignForm2("analysis") );
 	actprop->addRule( new RuleSignDiv2("analysis") );
+	actprop->addRule( new RuleSignDiv2n("analysis") );
 	actprop->addRule( new RuleDivChain("analysis") );
 	actprop->addRule( new RuleSignNearMult("analysis") );
 	actprop->addRule( new RuleModOpt("analysis") );

@@ -5280,6 +5280,103 @@ int4 RuleHumptyDumpty::applyOp(PcodeOp *op,Funcdata &data)
   return 1;
 }
 
+/// \class RulePieceAddSub
+/// \brief Simplify add-to-sub-register pattern: `concat( INT_ADD(sub(V,c), N), sub(V,0) )  =>  V + (N << c*8)`
+///
+/// A modification of a high or low sub-piece that is then concatenated back can be
+/// simplified to a single addition on the full value with the constant shifted appropriately.
+void RulePieceAddSub::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_PIECE);
+}
+
+int4 RulePieceAddSub::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  // PIECE(in0=hi, in1=lo)
+  // Look for pattern: one input is INT_ADD(SUBPIECE(V,off), const)
+  // and the other input is SUBPIECE(V, 0) or SUBPIECE(V, off2) such that they tile V.
+
+  for (int4 i = 0; i < 2; ++i) {
+    // i==0: check if input 0 (hi) has the ADD
+    // i==1: check if input 1 (lo) has the ADD
+    Varnode *vnAdd = op->getIn(i);
+    Varnode *vnOther = op->getIn(1 - i);
+
+    if (!vnAdd->isWritten()) continue;
+    PcodeOp *addOp = vnAdd->getDef();
+    if (addOp->code() != CPUI_INT_ADD) continue;
+
+    // One input of ADD should be SUBPIECE, the other a constant
+    Varnode *addIn0 = addOp->getIn(0);
+    Varnode *addIn1 = addOp->getIn(1);
+    PcodeOp *subAdd;
+    Varnode *constVn;
+    if (addIn0->isWritten() && addIn0->getDef()->code() == CPUI_SUBPIECE && addIn1->isConstant()) {
+      subAdd = addIn0->getDef();
+      constVn = addIn1;
+    } else if (addIn1->isWritten() && addIn1->getDef()->code() == CPUI_SUBPIECE && addIn0->isConstant()) {
+      subAdd = addIn1->getDef();
+      constVn = addIn0;
+    } else {
+      continue;
+    }
+
+    // The other PIECE input should be SUBPIECE of the same root
+    if (!vnOther->isWritten()) continue;
+    PcodeOp *subOther = vnOther->getDef();
+    if (subOther->code() != CPUI_SUBPIECE) continue;
+
+    Varnode *root = subAdd->getIn(0);
+    if (root != subOther->getIn(0)) continue;
+
+    int4 addSubOff = (int4)subAdd->getIn(1)->getOffset();
+    int4 otherOff = (int4)subOther->getIn(1)->getOffset();
+    int4 addSize = vnAdd->getSize();
+    int4 otherSize = vnOther->getSize();
+
+    // For PIECE(hi, lo): hi is at offset otherSize from bottom, lo is at offset 0
+    // input 0 is hi part, input 1 is lo part
+    int4 hiOff, loOff, hiSize, loSize;
+    if (i == 0) {
+      // input 0 (hi) has the add
+      hiOff = addSubOff;
+      hiSize = addSize;
+      loOff = otherOff;
+      loSize = otherSize;
+    } else {
+      // input 1 (lo) has the add
+      loOff = addSubOff;
+      loSize = addSize;
+      hiOff = otherOff;
+      hiSize = otherSize;
+    }
+
+    // lo part must start at offset 0 in root, hi part at offset loSize
+    if (loOff != 0) continue;
+    if (hiOff != loSize) continue;
+    // Together they must cover the whole root
+    if (hiSize + loSize != (int4)root->getSize()) continue;
+    // Output size must match root
+    if ((int4)op->getOut()->getSize() != (int4)root->getSize()) continue;
+
+    // Check lone descends
+    if (vnAdd->loneDescend() != op) continue;
+
+    // Compute the shifted constant
+    int4 shiftAmt = addSubOff * 8;
+    uintb mask = calc_mask(addSize);
+    uintb val = (constVn->getOffset() & mask) << shiftAmt;
+
+    data.opSetOpcode(op, CPUI_INT_ADD);
+    data.opSetInput(op, root, 0);
+    data.opSetInput(op, data.newConstant(root->getSize(), val), 1);
+    return 1;
+  }
+  return 0;
+}
+
 /// \class RuleDumptyHump
 /// \brief Simplify join and break apart: `sub( concat(V,W), c)  =>  sub(W,c)`
 ///
@@ -8413,6 +8510,127 @@ int4 RuleSignDiv2::applyOp(PcodeOp *op,Funcdata &data)
   data.opSetInput(op,a,0);
   data.opSetInput(op,data.newConstant(a->getSize(),2),1);
   data.opSetOpcode(op,CPUI_INT_SDIV);
+  return 1;
+}
+
+/// \class RuleSignDiv2n
+/// \brief Convert sign-based power-of-2 division: `(((V ^ S) - S) s>> N) ^ S) - S  =>  V s/ 2^N`
+///
+/// where S = V s>> (size*8-1).  This is the MSC 16-bit signed division by power-of-2 pattern.
+/// Note: subtraction `a - b` may appear as `INT_ADD(a, INT_MULT(b, -1))`.
+
+/// \brief Check if \b op computes `a - sign` where sign is returned.
+///
+/// Handles both `INT_SUB(a, sign)` and `INT_ADD(a, INT_MULT(sign, -1))`.
+/// \param op is the PcodeOp to check
+/// \param a will hold the other operand
+/// \param sign will hold the sign Varnode
+/// \return \b true if the pattern matches
+static bool matchSubSign(PcodeOp *op,Varnode *&a,Varnode *&sign)
+
+{
+  if (op->code() == CPUI_INT_SUB) {
+    a = op->getIn(0);
+    sign = op->getIn(1);
+    return true;
+  }
+  if (op->code() == CPUI_INT_ADD) {
+    // Check both input slots for INT_MULT(x, -1)
+    for (int4 i = 0; i < 2; ++i) {
+      Varnode *vn = op->getIn(i);
+      if (!vn->isWritten()) continue;
+      PcodeOp *multop = vn->getDef();
+      if (multop->code() != CPUI_INT_MULT) continue;
+      if (!multop->getIn(1)->isConstant()) continue;
+      if (multop->getIn(1)->getOffset() != calc_mask(multop->getIn(1)->getSize())) continue;
+      sign = multop->getIn(0);
+      a = op->getIn(1 - i);
+      return true;
+    }
+  }
+  return false;
+}
+
+void RuleSignDiv2n::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_INT_SUB);
+  oplist.push_back(CPUI_INT_ADD);
+}
+
+int4 RuleSignDiv2n::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  // Match:  result = (((V ^ S) - S) s>> N) ^ S) - S
+  // where S = V s>> (size*8-1)
+  // The outermost op is the final "- S"
+  Varnode *outerA, *outerSign;
+  if (!matchSubSign(op, outerA, outerSign)) return 0;
+
+  // outerA should be the result of XOR
+  if (!outerA->isWritten()) return 0;
+  PcodeOp *xor2op = outerA->getDef();
+  if (xor2op->code() != CPUI_INT_XOR) return 0;
+
+  // One input of the XOR should be outerSign, the other is the shift result
+  Varnode *shiftout = (Varnode *)0;
+  if (xor2op->getIn(0) == outerSign)
+    shiftout = xor2op->getIn(1);
+  else if (xor2op->getIn(1) == outerSign)
+    shiftout = xor2op->getIn(0);
+  else
+    return 0;
+
+  // shiftout should be INT_SRIGHT by constant N
+  if (!shiftout->isWritten()) return 0;
+  PcodeOp *shiftop = shiftout->getDef();
+  if (shiftop->code() != CPUI_INT_SRIGHT) return 0;
+  if (!shiftop->getIn(1)->isConstant()) return 0;
+  int4 n = (int4)shiftop->getIn(1)->getOffset();
+  if (n <= 0) return 0;
+
+  // Input to shift should be the result of "(V ^ S) - S"
+  Varnode *subout = shiftop->getIn(0);
+  if (!subout->isWritten()) return 0;
+  PcodeOp *subop = subout->getDef();
+  Varnode *innerA, *innerSign;
+  if (!matchSubSign(subop, innerA, innerSign)) return 0;
+
+  // innerSign must be the same as outerSign
+  if (innerSign != outerSign) return 0;
+
+  // innerA should be the result of XOR(V, S)
+  if (!innerA->isWritten()) return 0;
+  PcodeOp *xor1op = innerA->getDef();
+  if (xor1op->code() != CPUI_INT_XOR) return 0;
+
+  // One input of XOR should be outerSign, the other is V
+  Varnode *V = (Varnode *)0;
+  if (xor1op->getIn(0) == outerSign)
+    V = xor1op->getIn(1);
+  else if (xor1op->getIn(1) == outerSign)
+    V = xor1op->getIn(0);
+  else
+    return 0;
+
+  // outerSign must be V s>> (size*8-1)
+  if (!outerSign->isWritten()) return 0;
+  PcodeOp *signop = outerSign->getDef();
+  if (signop->code() != CPUI_INT_SRIGHT) return 0;
+  if (signop->getIn(0) != V) return 0;
+  if (!signop->getIn(1)->isConstant()) return 0;
+  int4 sz = V->getSize();
+  if ((int4)signop->getIn(1)->getOffset() != sz * 8 - 1) return 0;
+  if (V->isFree()) return 0;
+
+  // The shift amount N must be less than the sign shift
+  if (n >= sz * 8 - 1) return 0;
+
+  // Replace:  op becomes INT_SDIV(V, 1 << N)
+  uintb divisor = (uintb)1 << n;
+  data.opSetInput(op, V, 0);
+  data.opSetInput(op, data.newConstant(sz, divisor), 1);
+  data.opSetOpcode(op, CPUI_INT_SDIV);
   return 1;
 }
 

@@ -1295,6 +1295,17 @@ public:
   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
 };
 
+class RuleSignDiv2n : public Rule {
+public:
+  RuleSignDiv2n(const string &g) : Rule( g, 0, "signdiv2n") {}	///< Constructor
+  virtual Rule *clone(const ActionGroupList &grouplist) const {
+    if (!grouplist.contains(getGroup())) return (Rule *)0;
+    return new RuleSignDiv2n(getGroup());
+  }
+  virtual void getOpList(vector<uint4> &oplist) const;
+  virtual int4 applyOp(PcodeOp *op,Funcdata &data);
+};
+
 class RuleDivChain : public Rule {
 public:
   RuleDivChain(const string &g) : Rule( g, 0, "divchain") {}	///< Constructor
@@ -1522,6 +1533,17 @@ public:
   virtual void getOpList(vector<uint4> &oplist) const;
   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
   static Varnode *getBooleanResult(Varnode *vn,int4 bitPos,int4 &constRes);
+};
+
+class RulePieceAddSub : public Rule {
+public:
+  RulePieceAddSub(const string &g) : Rule(g, 0, "pieceaddsub") {}	///< Constructor
+  virtual Rule *clone(const ActionGroupList &grouplist) const {
+    if (!grouplist.contains(getGroup())) return (Rule *)0;
+    return new RulePieceAddSub(getGroup());
+  }
+  virtual void getOpList(vector<uint4> &oplist) const;
+  virtual int4 applyOp(PcodeOp *op,Funcdata &data);
 };
 
 class RulePiecePathology : public Rule {
