@@ -6357,7 +6357,11 @@ bool AddTreeState::spanAddTree(PcodeOp *op,uint8 treeCoeff)
   if (!valid) return false;
 
   if (pRelType != (const TypePointerRel *)0) {
-    if (multsum != 0 || nonmultsum >= size || !multiple.empty()) {
+    // For a relative pointer (mid-structure), we allow variable multiples of the struct size
+    // because they represent array indexing: ptr_to_field + index*struct_size == array[index].field
+    // Constant multiples (multsum != 0) are still disallowed as they indicate a constant array
+    // offset which cannot be cleanly represented through the relative pointer form.
+    if (multsum != 0 || nonmultsum >= size) {
       valid = false;
       return false;
     }
@@ -9233,6 +9237,238 @@ Varnode *RuleSignMod2nOpt2::checkMultiequalForm(PcodeOp *op,uintb npow)
   int4 negSlot = (negBlock == inner) ? innerSlot : (1-innerSlot);
   if (negSlot != slot) return (Varnode *)0;
   return base;
+}
+
+/// \class RuleSegmentCastPtrArith
+/// \brief Convert INT_ADD(INT_MULT(idx,stride), base_const) inside a SEGMENTOP inner slot
+///        into a spacebase PTRSUB + SUBPIECE + PTRADD + PTRSUB chain.
+///
+/// This rule fires after type recovery has started.  It detects the pattern:
+///
+///   SEGMENTOP(seg, base, [CAST(]INT_ADD(INT_MULT(idx, stride), base_const)[)])
+///
+/// where the inner expression is an array-plus-field address computation in the
+/// segmented address space.
+///
+/// The rule resolves the flat (RAM-space) address of the base constant through the
+/// segment operator, locates the corresponding array-of-struct symbol, and replaces
+/// the raw arithmetic sub-tree with the canonical pointer expression chain:
+///
+///   PTRSUB(spacebase_4byte, fullEncodingBase)  -- 4-byte far pointer to array[0]
+///   SUBPIECE(..., 0)[sz=nearPtrSize]           -- near (segment-relative) pointer to array[0]
+///   PTRADD(nearPtr, idx [+ N], stride)         -- near pointer to array[idx+N]
+///   PTRSUB(ptradd_out, fieldOff)               -- near pointer to array[idx+N].field
+///
+/// The final Varnode is wired into SEGMENTOP slot 2, allowing the printer to emit
+/// a well-typed, named field access instead of raw integer arithmetic.
+void RuleSegmentCastPtrArith::getOpList(vector<uint4> &oplist) const
+{
+  oplist.push_back(CPUI_SEGMENTOP);
+}
+
+int4 RuleSegmentCastPtrArith::applyOp(PcodeOp *op,Funcdata &data)
+{
+  if (!data.hasTypeRecoveryStarted()) return 0;
+
+  // SEGMENTOP slot 2 is the inner pointer expression.
+  // After ActionSetCasts a CAST may have been inserted, or the expression may be an INT_ADD directly.
+  Varnode *innerVn = op->getIn(2);
+  if (!innerVn->isWritten()) return 0;
+
+  // Unwrap an optional CAST to get to the INT_ADD
+  PcodeOp *addOp;
+  {
+    PcodeOp *maybecastOp = innerVn->getDef();
+    if (maybecastOp->code() == CPUI_CAST) {
+      Varnode *castIn = maybecastOp->getIn(0);
+      if (!castIn->isWritten()) return 0;
+      addOp = castIn->getDef();
+    } else {
+      addOp = maybecastOp;
+    }
+  }
+  if (addOp->code() != CPUI_INT_ADD) return 0;
+
+  // INT_ADD inputs: one INT_MULT(idx, stride_const), one constant
+  Varnode *multVn    = (Varnode *)0;
+  Varnode *baseConst = (Varnode *)0;
+  for (int4 s = 0; s < 2; ++s) {
+    Varnode *v = addOp->getIn(s);
+    if (v->isConstant()) {
+      baseConst = v;
+    } else if (v->isWritten() && v->getDef()->code() == CPUI_INT_MULT) {
+      multVn = v;
+    }
+  }
+  if (multVn == (Varnode *)0 || baseConst == (Varnode *)0) return 0;
+
+  // INT_MULT: one constant (stride), one variable (index)
+  PcodeOp *multOp   = multVn->getDef();
+  Varnode *idxVn    = (Varnode *)0;
+  Varnode *strideVn = (Varnode *)0;
+  for (int4 s = 0; s < 2; ++s) {
+    Varnode *v = multOp->getIn(s);
+    if (v->isConstant()) strideVn = v;
+    else                 idxVn    = v;
+  }
+  if (idxVn == (Varnode *)0 || strideVn == (Varnode *)0) return 0;
+
+  int4  ptrSize = innerVn->getSize();
+  uintb ptrmask = calc_mask(ptrSize);
+  uintb stride  = strideVn->getOffset() & ptrmask;
+  uintb baseOff = baseConst->getOffset() & ptrmask;
+  if (stride == 0) return 0;
+
+  uintb fieldOff       = baseOff % stride;
+  uintb arrayBaseConst = baseOff - fieldOff;
+
+  Architecture *glb = data.getArch();
+  SegmentOp *segdef = glb->userops.getSegmentOp(
+                          op->getIn(0)->getSpaceFromConst()->getIndex());
+  if (segdef == (SegmentOp *)0) return 0;
+  if (segdef->getResolve().space == (AddrSpace *)0) return 0;
+
+  uintb segBase = glb->context->getTrackedValue(segdef->getResolve(), op->getAddr());
+  vector<uintb> seginput;
+  seginput.push_back(segBase);
+  seginput.push_back(baseOff);
+  uintb flatBaseOff = segdef->execute(seginput);
+
+  AddrSpace *ramSpc = segdef->getSpace();
+  // Find the symbol containing/near flatBaseOff (= DS-relative base_const field address).
+  // The array access at base_const may be beyond the declared symbol bounds (e.g., if the
+  // array has fewer declared elements than being indexed). Walk backwards in stride-sized
+  // steps to find an array-of-struct symbol with element size matching stride.
+  SymbolEntry *entry = (SymbolEntry *)0;
+  uintb tryFlat = flatBaseOff;
+  const int maxSteps = 256;   // Safety limit
+  for (int step = 0; step <= maxSteps; ++step) {
+    Address tryAddr(ramSpc, AddrSpace::addressToByte(tryFlat, ramSpc->getWordSize()));
+    SymbolEntry *candidate = data.getScopeLocal()->getParent()->queryContainer(tryAddr, 1, Address());
+    if (candidate != (SymbolEntry *)0) {
+      Datatype *ct = candidate->getSymbol()->getType();
+      Datatype *elem = ct;
+      if (elem->getMetatype() == TYPE_ARRAY)
+        elem = ((TypeArray *)elem)->getBase();
+      uint4 ws = (ptrSize > 1) ? ramSpc->getWordSize() : 1;
+      uintb esz = AddrSpace::byteToAddressInt(elem->getAlignSize(), ws);
+      if (esz == stride && elem->getMetatype() == TYPE_STRUCT) {
+        entry = candidate;  // Found a struct-array symbol with matching stride
+        break;
+      }
+    }
+    if (tryFlat < stride) break;    // Underflow guard
+    tryFlat -= stride;
+  }
+  if (entry == (SymbolEntry *)0) return 0;
+  // Get the struct element type from the symbol (already validated in walkback)
+  Datatype *symType = entry->getSymbol()->getType();
+  Datatype *elemType = symType;
+  if (elemType->getMetatype() == TYPE_ARRAY)
+    elemType = ((TypeArray *)elemType)->getBase();
+  uint4 wordSize = (ptrSize > 1) ? ramSpc->getWordSize() : 1;
+
+  // Recompute fieldOff and arrayBaseConst using the symbol's actual flat base address.
+  // This is needed when the array DS-relative base is not stride-aligned.
+  // symbolFlatBase = flat address of array element[0]
+  uintb symbolFlatBase = AddrSpace::addressToByteInt(entry->getAddr().getOffset(),
+                                                      ramSpc->getWordSize());
+  uintb arrayBaseDS    = (symbolFlatBase - segBase * 16) & ptrmask; // DS-relative of array[0]
+  // Offset from array base to the accessed field = (baseOff - arrayBaseDS)
+  uintb offsetInArray  = (baseOff - arrayBaseDS) & ptrmask;         // in address units
+  fieldOff       = offsetInArray % stride;                          // field offset within struct
+  arrayBaseConst = (baseOff - fieldOff) & ptrmask;                  // DS-relative base of element at idx=0
+
+  TypePointer *structPtr = glb->types->getTypePointer(ptrSize, elemType, wordSize);
+  if (structPtr == (TypePointer *)0) return 0;
+
+  // Build the pointer expression using the far-pointer (spacebase + PTRSUB + SUBPIECE) pattern
+  // so the printer can resolve the named array symbol.
+  //
+  // Pattern mirrors the far-pointer working case:
+  //   PTRSUB(spacebase_4byte, fullEncodingBase)  => 4-byte ptr to array[0]
+  //   SUBPIECE(..., 0)[sz=2]                      => 2-byte DS-relative near ptr 0x80aa
+  //   INT_ADD(idxVn, N)                           => idx + N  (if N > 0)
+  //   PTRADD(subpiece_out, idx_adj, stride)       => near ptr to array[idx+N]
+  //   PTRSUB(ptradd_out, fieldOff)                => near ptr to array[idx+N].field
+  //
+  // Compute the DS-relative address of the array[0] base and the full 4-byte encoding.
+  uintb symBaseDSOff = (symbolFlatBase - segBase * 16) & ptrmask; // DS-relative of array[0]
+  int4 innersz = segdef->getInnerSize();   // size of near-pointer component (= 2 for x86-16)
+  int4 basesz  = segdef->getBaseSize();    // size of segment component (= 2 for x86-16)
+  int4 farSize = innersz + basesz;         // size of full far-pointer encoding (= 4)
+  uintb fullEncodingBase = (segBase << (8 * innersz)) | (symBaseDSOff & calc_mask(innersz));
+
+  // 4-byte spacebase constant using Funcdata helper (which sets the spacebase flag)
+  // ramSpc->getAddrSize() = 4 for x86-16 flat RAM space
+  Varnode *sbVn = data.constructConstSpacebase(ramSpc);
+
+  // PTRSUB(spacebase_4, fullEncodingBase) => 4-byte pointer to array[0]
+  Varnode *fullEncConst = data.newConstant(farSize, fullEncodingBase);
+  fullEncConst->setPtrCheck();
+  PcodeOp *ptrsubFarOp = data.newOpBefore(op, CPUI_PTRSUB, sbVn, fullEncConst);
+  Varnode *farPtrVn = ptrsubFarOp->getOut();
+  farPtrVn->setImplied();  // Render inline
+  // Attach the array symbol to the far-pointer constant so the printer can render the name.
+  data.linkSymbolReference(fullEncConst);
+  // The PTRSUB output is 4-byte (far pointer size); set its type to a 4-byte struct pointer.
+  TypePointer *farStructPtr = glb->types->getTypePointerStripArray(farSize, elemType, ramSpc->getWordSize());
+  if (farStructPtr != (TypePointer *)0)
+    farPtrVn->updateType(farStructPtr, true, false);  // typelock=true, override=false
+
+  // SUBPIECE(farPtrVn, 0)[sz=2] => near (DS-relative) 2-byte pointer to array[0]
+  // newOpBefore creates output with in1->getSize() = 4, but we need ptrSize (2).
+  // Create SUBPIECE manually with correct 2-byte output size.
+  PcodeOp *subpieceOp = data.newOp(2, op->getAddr());
+  data.opSetOpcode(subpieceOp, CPUI_SUBPIECE);
+  data.newUniqueOut(ptrSize, subpieceOp);  // 2-byte output
+  data.opSetInput(subpieceOp, farPtrVn, 0);
+  data.opSetInput(subpieceOp, data.newConstant(4, 0), 1);  // extract from byte 0
+  data.opInsertBefore(subpieceOp, op);
+  Varnode *nearPtrVn = subpieceOp->getOut();
+  nearPtrVn->setImplied();  // Render inline
+  nearPtrVn->updateType(structPtr, true, true);  // near ptr has struct type
+
+  // Compute N = element offset from array[0] to the element pointed to by arrayBaseConst
+  uintb elementN = (arrayBaseConst - symBaseDSOff) / stride;  // number of elements
+
+  // Build the index: idxVn [+ elementN if N > 0]
+  Varnode *ptraddIdxVn;
+  if (elementN == 0) {
+    ptraddIdxVn = idxVn;
+  } else {
+    PcodeOp *addNOp = data.newOpBefore(op, CPUI_INT_ADD,
+                                        idxVn,
+                                        data.newConstant(ptrSize, elementN));
+    ptraddIdxVn = addNOp->getOut();
+    ptraddIdxVn->setImplied();  // Render inline
+  }
+
+  // PTRADD(nearPtrVn, ptraddIdxVn, stride) => near ptr to array[idx + N]
+  PcodeOp *ptraddOp = data.newOpBefore(op, CPUI_PTRADD,
+                                        nearPtrVn,
+                                        ptraddIdxVn,
+                                        data.newConstant(ptrSize, stride));
+  Varnode *finalVn = ptraddOp->getOut();
+  finalVn->setImplied();  // Render inline
+  finalVn->updateType(structPtr, true, true);
+
+  // PTRSUB(finalVn, fieldOff) => near ptr to array[idx + N].field
+  if (fieldOff != 0) {
+    PcodeOp *ptrsubFieldOp = data.newOpBefore(op, CPUI_PTRSUB,
+                                               finalVn,
+                                               data.newConstant(ptrSize, fieldOff));
+    finalVn = ptrsubFieldOp->getOut();
+    finalVn->setImplied();  // Render inline
+    TypePointer *fieldPtr = glb->types->getTypePointerStripArray(ptrSize, elemType, wordSize);
+    if (fieldPtr != (TypePointer *)0)
+      finalVn->updateType(fieldPtr, true, true);
+  }
+
+  // Wire the new pointer expression into SEGMENTOP slot 2
+  data.opSetInput(op, finalVn, 2);
+
+  return 1;
 }
 
 /// \class RuleSegment

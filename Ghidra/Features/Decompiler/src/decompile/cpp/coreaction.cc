@@ -5838,6 +5838,17 @@ void ActionDatabase::universalAction(Architecture *conf)
   act->addAction( new ActionDynamicSymbols("dynamic") );
   act->addAction( new ActionNameVars("merge") );
   act->addAction( new ActionSetCasts("casts") );
+  {
+    // Post-cast fixup pool: runs after ActionSetCasts and ActionAssignHigh, so HighVariables
+    // exist and type casts are already in place.  RuleSegmentCastPtrArith fires on SEGMENTOP
+    // ops whose inner slot contains an INT_ADD(INT_MULT(idx,stride), base_const) pattern,
+    // replacing it with a spacebase PTRSUB+SUBPIECE+PTRADD+PTRSUB chain so that the
+    // printer renders clean named array access (e.g. array[idx+N].field) instead of
+    // raw integer arithmetic.
+    ActionPool *actpostcast = new ActionPool(Action::rule_repeatapply,"postcasts");
+    actpostcast->addRule( new RuleSegmentCastPtrArith("casts") );
+    act->addAction( actpostcast );
+  }
   act->addAction( new ActionFinalStructure("blockrecovery") );
   act->addAction( new ActionPrototypeWarnings("protorecovery") );
   act->addAction( new ActionStop("base") );
