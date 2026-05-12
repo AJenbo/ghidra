@@ -9289,35 +9289,120 @@ int4 RuleSegmentCastPtrArith::applyOp(PcodeOp *op,Funcdata &data)
   }
   if (addOp->code() != CPUI_INT_ADD) return 0;
 
-  // INT_ADD inputs: one INT_MULT(idx, stride_const), one constant
-  Varnode *multVn    = (Varnode *)0;
-  Varnode *baseConst = (Varnode *)0;
-  for (int4 s = 0; s < 2; ++s) {
-    Varnode *v = addOp->getIn(s);
-    if (v->isConstant()) {
-      baseConst = v;
-    } else if (v->isWritten() && v->getDef()->code() == CPUI_INT_MULT) {
-      multVn = v;
-    }
-  }
-  if (multVn == (Varnode *)0 || baseConst == (Varnode *)0) return 0;
-
-  // INT_MULT: one constant (stride), one variable (index)
-  PcodeOp *multOp   = multVn->getDef();
-  Varnode *idxVn    = (Varnode *)0;
-  Varnode *strideVn = (Varnode *)0;
-  for (int4 s = 0; s < 2; ++s) {
-    Varnode *v = multOp->getIn(s);
-    if (v->isConstant()) strideVn = v;
-    else                 idxVn    = v;
-  }
-  if (idxVn == (Varnode *)0 || strideVn == (Varnode *)0) return 0;
-
   int4  ptrSize = innerVn->getSize();
   uintb ptrmask = calc_mask(ptrSize);
-  uintb stride  = strideVn->getOffset() & ptrmask;
-  uintb baseOff = baseConst->getOffset() & ptrmask;
-  if (stride == 0) return 0;
+
+  // The INT_ADD can take several forms.  In all cases we need to extract:
+  //   multVn  — the Varnode produced by INT_MULT(idx, stride)
+  //   baseOff — the DS-relative address constant (field address at element 0)
+  //
+  // Pattern A (simple): INT_ADD(INT_MULT(idx,stride), const)
+  //   The base is a plain constant.
+  //
+  // Pattern B (far-ptr base): INT_ADD(SUBPIECE(PTRSUB(PTRSUB(spacebase,enc),fldOff)[sz=4], 0)[sz=2], INT_MULT(...))
+  //   Ghidra already encoded the field address as a far-pointer expression whose low 16 bits
+  //   equal the DS-relative field address.  We extract the constant from the innermost PTRSUB.
+  //
+  // Pattern C (far-ptr base + extra offset): INT_ADD(INT_ADD(SUBPIECE(far_ptr,0), extra_const), INT_MULT(...))
+  //   Like B but with an additional constant added (e.g. "+2" for a sub-field).
+  //
+  // Helper: try to extract a DS-relative base constant from a SUBPIECE(ptrsub_chain, 0) varnode.
+  // Returns (uintb)-1 on failure.
+  auto extractFarPtrBase = [&](Varnode *vn) -> uintb {
+    // Must be SUBPIECE(..., 0) of size ptrSize
+    if (!vn->isWritten()) return (uintb)-1;
+    PcodeOp *spOp = vn->getDef();
+    if (spOp->code() != CPUI_SUBPIECE) return (uintb)-1;
+    if (!spOp->getIn(1)->isConstant()) return (uintb)-1;
+    if (spOp->getIn(1)->getOffset() != 0) return (uintb)-1;
+    // Walk into the expression being SUBPIECEd — strip PTRSUBs to find the encoded constant.
+    // The encoding is: PTRSUB(PTRSUB(spacebase, enc), fieldOff) — we want the low ptrSize
+    // bytes of the final address, which equals enc & ptrmask (the DS-relative field address).
+    // Strategy: walk the PTRSUB chain accumulating fieldOff additions, then find enc.
+    Varnode *cur = spOp->getIn(0);
+    uintb accum = 0;
+    for (int depth = 0; depth < 4 && cur->isWritten(); ++depth) {
+      PcodeOp *def = cur->getDef();
+      if (def->code() == CPUI_PTRSUB) {
+        // PTRSUB(base, offset) — offset is a field/element offset
+        Varnode *offVn = def->getIn(1);
+        if (!offVn->isConstant()) return (uintb)-1;
+        accum += offVn->getOffset();
+        cur = def->getIn(0);
+      } else {
+        break;
+      }
+    }
+    // cur should now be a PTRSUB(spacebase_or_const, enc) or just a constant
+    if (cur->isConstant()) {
+      // The constant IS the full far-encoding; low ptrSize bytes = DS-relative base
+      return (cur->getOffset() & ptrmask) + (accum & ptrmask);
+    }
+    if (!cur->isWritten()) return (uintb)-1;
+    PcodeOp *outerDef = cur->getDef();
+    if (outerDef->code() == CPUI_PTRSUB) {
+      Varnode *encVn = outerDef->getIn(1);
+      if (!encVn->isConstant()) return (uintb)-1;
+      return (encVn->getOffset() & ptrmask) + (accum & ptrmask);
+    }
+    return (uintb)-1;
+  };
+
+  Varnode *multVn  = (Varnode *)0;
+  uintb    baseOff = (uintb)-1;
+
+  // Try to identify multVn and baseOff from the INT_ADD inputs.
+  // First pass: look for INT_MULT on either side.
+  Varnode *sides[2] = { addOp->getIn(0), addOp->getIn(1) };
+  for (int4 s = 0; s < 2; ++s) {
+    if (sides[s]->isWritten() && sides[s]->getDef()->code() == CPUI_INT_MULT)
+      multVn = sides[s];
+  }
+  if (multVn == (Varnode *)0) return 0;  // No INT_MULT anywhere — give up.
+
+  // The other side carries the base address (possibly wrapped).
+  Varnode *baseSide = (multVn == sides[0]) ? sides[1] : sides[0];
+
+  if (baseSide->isConstant()) {
+    // Pattern A: plain constant base
+    baseOff = baseSide->getOffset() & ptrmask;
+  } else {
+    // Pattern B: SUBPIECE(far_ptr_expr, 0)
+    uintb extracted = extractFarPtrBase(baseSide);
+    if (extracted != (uintb)-1) {
+      baseOff = extracted & ptrmask;
+    } else if (baseSide->isWritten() && baseSide->getDef()->code() == CPUI_INT_ADD) {
+      // Pattern C: INT_ADD(SUBPIECE(far_ptr_expr, 0), extra_const)
+      PcodeOp *innerAdd = baseSide->getDef();
+      Varnode *ia0 = innerAdd->getIn(0), *ia1 = innerAdd->getIn(1);
+      Varnode *subpieceVn = (Varnode *)0;
+      uintb    extraOff   = 0;
+      if (ia1->isConstant()) { extraOff = ia1->getOffset(); subpieceVn = ia0; }
+      else if (ia0->isConstant()) { extraOff = ia0->getOffset(); subpieceVn = ia1; }
+      if (subpieceVn != (Varnode *)0) {
+        uintb extracted2 = extractFarPtrBase(subpieceVn);
+        if (extracted2 != (uintb)-1)
+          baseOff = (extracted2 + extraOff) & ptrmask;
+      }
+    }
+  }
+  if (baseOff == (uintb)-1) return 0;
+
+  // Extract stride and idxVn from INT_MULT
+  Varnode *idxVn    = (Varnode *)0;
+  uintb    stride   = 0;
+  {
+    PcodeOp *multOp   = multVn->getDef();
+    Varnode *strideVn = (Varnode *)0;
+    for (int4 s = 0; s < 2; ++s) {
+      Varnode *v = multOp->getIn(s);
+      if (v->isConstant()) strideVn = v;
+      else                 idxVn    = v;
+    }
+    if (idxVn == (Varnode *)0 || strideVn == (Varnode *)0) return 0;
+    stride = strideVn->getOffset() & ptrmask;
+    if (stride == 0) return 0;
+  }
 
   uintb fieldOff       = baseOff % stride;
   uintb arrayBaseConst = baseOff - fieldOff;
@@ -9335,6 +9420,7 @@ int4 RuleSegmentCastPtrArith::applyOp(PcodeOp *op,Funcdata &data)
   uintb flatBaseOff = segdef->execute(seginput);
 
   AddrSpace *ramSpc = segdef->getSpace();
+
   // Find the symbol containing/near flatBaseOff (= DS-relative base_const field address).
   // The array access at base_const may be beyond the declared symbol bounds (e.g., if the
   // array has fewer declared elements than being indexed). Walk backwards in stride-sized
@@ -9467,6 +9553,13 @@ int4 RuleSegmentCastPtrArith::applyOp(PcodeOp *op,Funcdata &data)
 
   // Wire the new pointer expression into SEGMENTOP slot 2
   data.opSetInput(op, finalVn, 2);
+
+  // Update the SEGMENTOP output type to match.  Without this the downstream consumer
+  // (e.g. a PTRSUB that applies the field offset) sees an untyped pointer and the
+  // printer falls back to *(uint*)&(...)->field notation.
+  Varnode *segOut = op->getOut();
+  if (segOut != (Varnode *)0)
+    segOut->updateType(structPtr, true, true);
 
   return 1;
 }
